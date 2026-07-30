@@ -1,0 +1,51 @@
+[package]
+name = "mstsc-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "A native Windows Remote Desktop client hosting the system RDP ActiveX control"
+license = "MIT"
+repository = "https://github.com/LeeEirc/mstsc-rs"
+
+[lib]
+name = "mstsc_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mstsc-rs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Security_Cryptography",
+    "Security_Cryptography_DataProtection",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
