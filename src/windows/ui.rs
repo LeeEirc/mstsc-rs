@@ -359,8 +359,7 @@ impl AppState {
             }
             RdpEventKind::DialogDismissed
             | RdpEventKind::NetworkStatusChanged
-            | RdpEventKind::RemoteDesktopSizeChanged
-            | RdpEventKind::StatusChanged => {}
+            | RdpEventKind::RemoteDesktopSizeChanged => {}
         }
     }
 }

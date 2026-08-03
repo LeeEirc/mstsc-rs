@@ -55,7 +55,6 @@ pub(super) enum RdpEventKind {
     DialogDismissed,
     NetworkStatusChanged,
     RemoteDesktopSizeChanged,
-    StatusChanged,
 }
 
 pub(super) struct RdpEvent {
