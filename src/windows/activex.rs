@@ -4,12 +4,14 @@ use std::sync::{Arc, Mutex};
 use windows::Security::Cryptography::DataProtection::DataProtectionProvider;
 use windows::Security::Cryptography::{BinaryStringEncoding, CryptographicBuffer};
 use windows::Win32::Foundation::{
-    DISP_E_UNKNOWNNAME, E_NOINTERFACE, E_NOTIMPL, HWND, LPARAM, RECT, SIZE, WPARAM,
+    DISP_E_UNKNOWNNAME, E_NOINTERFACE, E_NOTIMPL, FreeLibrary, HMODULE, HWND, LPARAM, RECT, SIZE,
+    WPARAM,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CoCreateInstance, DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO, IDispatch,
     IDispatch_Impl, IPersistStreamInit, ITypeInfo,
 };
+use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 use windows::Win32::System::Ole::{
     IOleClientSite, IOleClientSite_Impl, IOleContainer, IOleInPlaceActiveObject, IOleInPlaceFrame,
     IOleInPlaceFrame_Impl, IOleInPlaceObject, IOleInPlaceSite, IOleInPlaceSite_Impl,
@@ -318,10 +320,38 @@ pub(super) struct ActiveXHost {
     client: IRemoteDesktopClient,
     callbacks: Vec<(BSTR, IDispatch)>,
     events: Arc<Mutex<Vec<RdpEvent>>>,
+    // Must be dropped after every COM interface sourced from mstscax.dll.
+    _rdp_module: LoadedModule,
+}
+
+struct LoadedModule(HMODULE);
+
+impl LoadedModule {
+    fn load_system_rdp() -> Result<Self> {
+        let module = unsafe {
+            LoadLibraryExW(
+                windows::core::w!("mstscax.dll"),
+                None,
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        }
+        .windows_context("loading the system RDP control from System32")?;
+        Ok(Self(module))
+    }
+}
+
+impl Drop for LoadedModule {
+    fn drop(&mut self) {
+        let _ = unsafe { FreeLibrary(self.0) };
+    }
 }
 
 impl ActiveXHost {
-    pub fn create(hwnd: HWND, config: &SessionConfig) -> Result<Self> {
+    fn activate(hwnd: HWND) -> Result<Self> {
+        // Never search the application directory for mstscax.dll. Apart from
+        // detecting a damaged Windows installation early, this prevents a DLL
+        // placed next to the executable from shadowing the serviced system copy.
+        let rdp_module = LoadedModule::load_system_rdp()?;
         let site = ComObject::new(ActiveXSite { hwnd });
         let unknown: IUnknown =
             unsafe { CoCreateInstance(&CLSID_REMOTE_DESKTOP_CLIENT, None, CLSCTX_INPROC_SERVER) }
@@ -352,19 +382,23 @@ impl ActiveXHost {
         let mut rect = RECT::default();
         unsafe { GetClientRect(hwnd, &mut rect) }.windows_context("querying the client area")?;
         unsafe {
-            ole_object
-                .DoVerb(
-                    OLEIVERB_INPLACEACTIVATE.0,
-                    std::ptr::null(),
-                    &client_site,
-                    0,
-                    hwnd,
-                    &rect,
-                )
-                .windows_context("activating the embedded RDP control")?;
+            if let Err(source) = ole_object.DoVerb(
+                OLEIVERB_INPLACEACTIVATE.0,
+                std::ptr::null(),
+                &client_site,
+                0,
+                hwnd,
+                &rect,
+            ) {
+                let _ = ole_object.SetClientSite(None);
+                return Err(crate::error::Error::Windows {
+                    context: "activating the embedded RDP control",
+                    source,
+                });
+            }
         }
 
-        let mut host = Self {
+        Ok(Self {
             site,
             inplace_object: unknown.cast().ok(),
             active_object: unknown.cast().ok(),
@@ -372,7 +406,12 @@ impl ActiveXHost {
             client,
             callbacks: Vec::new(),
             events: Arc::new(Mutex::new(Vec::new())),
-        };
+            _rdp_module: rdp_module,
+        })
+    }
+
+    pub fn create(hwnd: HWND, config: &SessionConfig) -> Result<Self> {
+        let mut host = Self::activate(hwnd)?;
 
         let settings = unsafe { host.client.Settings() }
             .windows_context("opening the RDP settings interface")?;
@@ -488,4 +527,81 @@ fn encrypt_password(password: &str) -> Result<String> {
     CryptographicBuffer::EncodeToBase64String(&protected)
         .map(|value| value.to_string())
         .windows_context("encoding the protected password")
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
+    use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_OVERLAPPED, WS_VISIBLE,
+    };
+    use windows::core::w;
+
+    use super::ActiveXHost;
+
+    struct WinRtGuard;
+
+    impl Drop for WinRtGuard {
+        fn drop(&mut self) {
+            unsafe { RoUninitialize() };
+        }
+    }
+
+    struct OleGuard;
+
+    impl Drop for OleGuard {
+        fn drop(&mut self) {
+            unsafe { OleUninitialize() };
+        }
+    }
+
+    struct WindowGuard(HWND);
+
+    impl Drop for WindowGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    #[test]
+    fn system_rdp_control_can_be_activated() {
+        // Use a fresh thread so no other test can have selected a conflicting
+        // COM apartment model. This is a runtime test, not merely a registry
+        // or type check: it executes the same OLE activation as the application.
+        std::thread::spawn(|| {
+            unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }
+                .expect("Windows Runtime STA initialization must succeed");
+            let _winrt = WinRtGuard;
+            unsafe { OleInitialize(None) }.expect("OLE STA initialization must succeed");
+            let _ole = OleGuard;
+
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("mstsc-rs COM activation test"),
+                    WINDOW_STYLE(WS_OVERLAPPED.0 | WS_VISIBLE.0),
+                    0,
+                    0,
+                    640,
+                    480,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("test host window must be created");
+            let window = WindowGuard(hwnd);
+
+            let host = ActiveXHost::activate(window.0)
+                .expect("the system Remote Desktop ActiveX control must activate");
+            drop(host);
+            drop(window);
+        })
+        .join()
+        .expect("COM activation test thread must not panic");
+    }
 }

@@ -27,9 +27,9 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  linux-test:
-    name: Linux checks
-    runs-on: ubuntu-latest
+  windows-build:
+    name: Windows x64 checks and build
+    runs-on: windows-latest
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,22 +42,6 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run unit tests
-        run: cargo test --locked --all-targets
-
-      - name: Check Windows target
-        run: cargo check --locked --target x86_64-pc-windows-msvc
-
-  windows-build:
-    name: Windows x64 build
-    runs-on: windows-latest
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Show Rust toolchain
-        run: rustup show
 
       - name: Run unit tests
         run: cargo test --locked --all-targets
@@ -104,9 +88,8 @@ jobs:
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs:
-      - linux-test
       - windows-build
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     permissions:
       contents: write
     steps:
@@ -121,58 +104,59 @@ jobs:
 
       - name: Validate release version
         id: release
-        shell: bash
+        shell: pwsh
         env:
           MANUAL_TAG: ${{ inputs.release_tag }}
           MANUAL_PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          set -euo pipefail
-          package_version="$(cargo metadata --locked --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "mstsc-rs") | .version')"
+          $ErrorActionPreference = "Stop"
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $packageVersion = ($metadata.packages | Where-Object name -eq "mstsc-rs").version
 
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            tag="$MANUAL_TAG"
-            prerelease="$MANUAL_PRERELEASE"
-          else
-            tag="$GITHUB_REF_NAME"
-            prerelease="false"
-          fi
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            $tag = $env:MANUAL_TAG
+            $prerelease = $env:MANUAL_PRERELEASE
+          } else {
+            $tag = $env:GITHUB_REF_NAME
+            $prerelease = "false"
+          }
 
-          expected_tag="v$package_version"
-          if [[ "$tag" != "$expected_tag" ]]; then
-            echo "::error::发布标签必须与 Cargo.toml 版本一致：期望 $expected_tag，实际 $tag"
-            exit 1
-          fi
+          $expectedTag = "v$packageVersion"
+          if ($tag -ne $expectedTag) {
+            Write-Error "发布标签必须与 Cargo.toml 版本一致：期望 $expectedTag，实际 $tag"
+          }
 
-          if [[ "$tag" == *-* ]]; then
-            prerelease="true"
-          fi
+          if ($tag.Contains("-")) {
+            $prerelease = "true"
+          }
 
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "prerelease=$($prerelease.ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Create GitHub Release
-        shell: bash
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           IS_PRERELEASE: ${{ steps.release.outputs.prerelease }}
         run: |
-          set -euo pipefail
-          options=(
-            --repo "$GITHUB_REPOSITORY"
-            --title "$RELEASE_TAG"
-            --generate-notes
+          $ErrorActionPreference = "Stop"
+          $options = @(
+            "--repo", $env:GITHUB_REPOSITORY,
+            "--title", $env:RELEASE_TAG,
+            "--generate-notes"
           )
 
-          if [[ "$IS_PRERELEASE" == "true" ]]; then
-            options+=(--prerelease)
-          fi
+          if ($env:IS_PRERELEASE -eq "true") {
+            $options += "--prerelease"
+          }
 
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            options+=(--target "$GITHUB_SHA")
-          else
-            options+=(--verify-tag)
-          fi
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            $options += @("--target", $env:GITHUB_SHA)
+          } else {
+            $options += "--verify-tag"
+          }
 
-          gh release create "$RELEASE_TAG" dist/* "${options[@]}"
+          $files = Get-ChildItem "dist" -File | ForEach-Object FullName
+          & gh release create $env:RELEASE_TAG @files @options
