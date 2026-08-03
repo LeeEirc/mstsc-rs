@@ -5,10 +5,10 @@
 - Rust `1.97.1`（由 `rust-toolchain.toml` 固定）
 - 目标 `x86_64-pc-windows-msvc`
 - Windows 10/11 x64 运行环境
-- Linux 交叉链接使用 `cargo-xwin`
 
 选择 MSVC ABI 是因为系统 ActiveX/COM、Windows SDK 导入库和部署环境都以官方 MSVC
-ABI 为基准。`.cargo/config.toml` 启用 `+crt-static`，将 MSVC CRT 静态链接到 EXE；
+ABI 为基准。项目只在 Windows 本机和 GitHub Actions Windows runner 构建，不使用
+Linux 交叉构建。`.cargo/config.toml` 启用 `+crt-static`，将 MSVC CRT 静态链接到 EXE；
 运行时只依赖 Windows 自带的系统 DLL 和已注册的 `mstscax.dll`。
 
 ## Windows 原生构建
@@ -21,20 +21,9 @@ cargo test --all-targets
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-## Linux 交叉构建
-
-```bash
-rustup show
-cargo install cargo-xwin --locked
-cargo test --all-targets
-cargo xwin build --release --locked --target x86_64-pc-windows-msvc
-```
-
-`cargo-xwin` 下载编译/链接所需的 Windows SDK 和 MSVC CRT 元数据，不需要 Wine。
-
 ## 测试层次
 
-### Linux 可执行
+### Windows 自动测试
 
 - `.rdp` UTF-8/UTF-16 解析；
 - 未知字段和重复项保留；
@@ -42,12 +31,10 @@ cargo xwin build --release --locked --target x86_64-pc-windows-msvc
 - CLI 斜杠参数；
 - 配置覆盖顺序；
 - 缺失字段识别；
-- Windows 目标类型检查；
-- Windows x64 EXE 交叉链接。
+- Windows x64 release 构建和 EXE 冒烟测试；
+- 从 `System32` 加载 `mstscax.dll`，创建 COM 类并执行 OLE 原位激活。
 
-### Windows 自动测试
-
-同一批跨平台单元测试可在 Windows runner 上运行。它们不建立网络连接。
+自动测试不建立真实 RDP 网络连接。
 
 ### Windows 手工/集成测试
 
@@ -97,8 +84,8 @@ ZIP 中包含 EXE、README 和 MIT 许可证。程序不需要复制 `mstscax.dl
 分发系统 DLL。运行时若系统控件未注册，程序会显示包含创建
 `RemoteDesktopClient` 失败上下文的错误。
 
-工作流会核对发布标签与 Cargo 包版本、执行 Linux 格式/Clippy/单元测试、Windows
-单元测试和 EXE 冒烟测试，并生成 SHA-256。普通 CI 构建的 Windows 包也会作为
+工作流会核对发布标签与 Cargo 包版本，并全部在 Windows runner 上执行格式、Clippy、
+单元测试、COM 激活测试、EXE 冒烟测试和 SHA-256 生成。普通 CI 构建的 Windows 包也会作为
 Actions artifact 保留 14 天，便于在正式发布前下载测试。
 
 正式分发建议额外执行：

@@ -21,7 +21,7 @@ COM 组件。
 - 参数缺少服务器、用户名或密码时显示 Win32 原生补全界面；
 - 保留系统证书、身份和本地资源重定向安全提示，不提供静默忽略证书的选项；
 - 一个进程、一个窗口、一个 RDP 会话；
-- Windows 原生构建，以及 Linux 上通过 `cargo-xwin` 构建 Windows x64 EXE。
+- Windows x64 原生构建，并通过 GitHub Actions 的 Windows runner 测试和打包。
 
 ## 快速使用
 
@@ -81,21 +81,15 @@ Windows MSVC：
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-Linux：
-
-```bash
-cargo install cargo-xwin --locked
-cargo xwin build --release --locked --target x86_64-pc-windows-msvc
-```
-
 产物位于：
 
 ```text
 target/x86_64-pc-windows-msvc/release/mstsc-rs.exe
 ```
 
-Linux 能完成编译与链接，但 ActiveX、证书对话框、设备重定向和实际 RDP 连接只能在
-Windows 10/11 上集成测试。
+项目不使用 Linux 交叉构建发布文件。ActiveX 控件的加载和原位激活会在 GitHub Actions
+的 Windows runner 上实际执行；证书对话框、设备重定向和真实 RDP 连接仍需在 Windows
+10/11 环境中手工集成测试。
 
 ## 下载与发布
 
@@ -106,8 +100,8 @@ Windows 10/11 上集成测试。
 - `mstsc-rs-vX.Y.Z-windows-x64.zip`：包含 EXE、README 和许可证的压缩包；
 - `SHA256SUMS.txt`：发布文件的 SHA-256 校验值。
 
-推送与 `Cargo.toml` 版本一致的 `vX.Y.Z` 标签后，GitHub Actions 会先完成 Linux
-检查、Windows 测试和发布构建，再自动创建 Release。也可以在 Actions 页面的
+推送与 `Cargo.toml` 版本一致的 `vX.Y.Z` 标签后，GitHub Actions 会在 Windows runner
+完成格式、Clippy、单元测试、COM 激活测试和发布构建，再自动创建 Release。也可以在 Actions 页面的
 `CI and Release` 工作流中手动填写 `release_tag` 发布；留空只运行 CI。
 
 ## 文档

@@ -1,41 +1,47 @@
+use std::ffi::c_void;
 use std::mem::{ManuallyDrop, size_of};
 use std::sync::{Arc, Mutex};
 
-use windows::Security::Cryptography::DataProtection::DataProtectionProvider;
-use windows::Security::Cryptography::{BinaryStringEncoding, CryptographicBuffer};
 use windows::Win32::Foundation::{
     DISP_E_UNKNOWNNAME, E_NOINTERFACE, E_NOTIMPL, FreeLibrary, HMODULE, HWND, LPARAM, RECT, SIZE,
-    WPARAM,
+    VARIANT_BOOL, WPARAM,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, CoCreateInstance, DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO, IDispatch,
-    IDispatch_Impl, IPersistStreamInit, ITypeInfo,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
+    DISPATCH_PROPERTYPUT, DISPPARAMS, EXCEPINFO, IConnectionPoint, IConnectionPointContainer,
+    IDispatch, IDispatch_Impl, IPersistStreamInit, ITypeInfo,
 };
 use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 use windows::Win32::System::Ole::{
-    IOleClientSite, IOleClientSite_Impl, IOleContainer, IOleInPlaceActiveObject, IOleInPlaceFrame,
-    IOleInPlaceFrame_Impl, IOleInPlaceObject, IOleInPlaceSite, IOleInPlaceSite_Impl,
-    IOleInPlaceUIWindow, IOleInPlaceUIWindow_Impl, IOleObject, IOleWindow_Impl, OLECLOSE_NOSAVE,
-    OLEGETMONIKER, OLEINPLACEFRAMEINFO, OLEIVERB_INPLACEACTIVATE, OLEMENUGROUPWIDTHS, OLEWHICHMK,
-    OleSetContainedObject,
+    DISPID_PROPERTYPUT, IOleClientSite, IOleClientSite_Impl, IOleContainer,
+    IOleInPlaceActiveObject, IOleInPlaceFrame, IOleInPlaceFrame_Impl, IOleInPlaceObject,
+    IOleInPlaceSite, IOleInPlaceSite_Impl, IOleInPlaceUIWindow, IOleInPlaceUIWindow_Impl,
+    IOleObject, IOleWindow_Impl, OLECLOSE_NOSAVE, OLEGETMONIKER, OLEINPLACEFRAMEINFO,
+    OLEIVERB_INPLACEACTIVATE, OLEMENUGROUPWIDTHS, OLEWHICHMK, OleSetContainedObject,
 };
-use windows::Win32::System::RemoteDesktop::IRemoteDesktopClient;
 use windows::Win32::System::Variant::{
-    VARIANT, VT_BSTR, VT_I2, VT_I4, VT_INT, VT_UI2, VT_UI4, VT_UINT,
+    VARIANT, VT_BOOL, VT_BSTR, VT_DISPATCH, VT_EMPTY, VT_I2, VT_I4, VT_INT, VT_UI2, VT_UI4,
+    VT_UINT, VariantClear,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, HACCEL, HMENU, MSG, PostMessageW};
 use windows::core::{
-    BOOL, BSTR, ComObject, Error as WinError, GUID, HRESULT, HSTRING, IUnknown, IUnknownImpl,
-    Interface, OutRef, PCWSTR, Ref,
+    BOOL, BSTR, ComObject, Error as WinError, GUID, HRESULT, IUnknown, IUnknownImpl, Interface,
+    OutRef, PCWSTR, Ref,
 };
 
 use crate::config::SessionConfig;
 use crate::error::{Result, WindowsContext};
+use crate::rdp::RdpDocument;
 
 use super::ui::WM_RDP_EVENT;
 
-// CLSID_RemoteDesktopClient, built into mstscax.dll on Windows 10/11.
-const CLSID_REMOTE_DESKTOP_CLIENT: GUID = GUID::from_u128(0xeab16c5d_eed1_4e95_868b_0fba1b42c092);
+// Microsoft RDP Client Control (not safe for scripting), version 9. Microsoft
+// documents this Windows 8.1 class as compatible with later Windows versions.
+// Unlike CLSID_RemoteDesktopClient, this class is supported in normal desktop
+// processes rather than being restricted to a Store/AppContainer host.
+const CLSID_MS_RDP_CLIENT_NOT_SAFE_FOR_SCRIPTING: GUID =
+    GUID::from_u128(0x8b918b82_7985_4c24_89df_c33ad2bbfbcd);
+const DIID_MS_TSC_AX_EVENTS: GUID = GUID::from_u128(0x336d5562_efa8_482e_8cb3_c5c0fc7a7db6);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RdpEventKind {
@@ -237,7 +243,6 @@ impl IOleInPlaceFrame_Impl for ActiveXSite_Impl {
 #[windows::core::implement(IDispatch)]
 struct EventCallback {
     hwnd: HWND,
-    kind: RdpEventKind,
     events: Arc<Mutex<Vec<RdpEvent>>>,
 }
 
@@ -272,15 +277,30 @@ impl IDispatch_Impl for EventCallback_Impl {
         _pexcepinfo: *mut EXCEPINFO,
         _puargerr: *mut u32,
     ) -> windows::core::Result<()> {
+        let Some(kind) = legacy_event_kind(_dispidmember) else {
+            return Ok(());
+        };
         let arguments = unsafe { dispatch_arguments(pdispparams) };
         if let Ok(mut events) = self.events.lock() {
-            events.push(RdpEvent {
-                kind: self.kind,
-                arguments,
-            });
+            events.push(RdpEvent { kind, arguments });
             let _ = unsafe { PostMessageW(Some(self.hwnd), WM_RDP_EVENT, WPARAM(0), LPARAM(0)) };
         }
         Ok(())
+    }
+}
+
+fn legacy_event_kind(dispid: i32) -> Option<RdpEventKind> {
+    match dispid {
+        1 => Some(RdpEventKind::Connecting),
+        2 => Some(RdpEventKind::Connected),
+        3 => Some(RdpEventKind::LoginCompleted),
+        4 => Some(RdpEventKind::Disconnected),
+        12 => Some(RdpEventKind::RemoteDesktopSizeChanged),
+        18 => Some(RdpEventKind::DialogDisplaying),
+        19 => Some(RdpEventKind::DialogDismissed),
+        30 => Some(RdpEventKind::NetworkStatusChanged),
+        32 => Some(RdpEventKind::StatusChanged),
+        _ => None,
     }
 }
 
@@ -312,16 +332,181 @@ fn variant_to_string(value: &VARIANT) -> Option<String> {
     }
 }
 
+windows_core::imp::define_interface!(
+    IMsTscNonScriptable,
+    IMsTscNonScriptable_Vtbl,
+    0xc1e6743a_41c1_4a74_832a_0dd06c1c7a0e
+);
+windows_core::imp::interface_hierarchy!(IMsTscNonScriptable, IUnknown);
+
+#[repr(C)]
+pub struct IMsTscNonScriptable_Vtbl {
+    base__: windows_core::IUnknown_Vtbl,
+    put_clear_text_password:
+        unsafe extern "system" fn(*mut c_void, *mut c_void) -> windows_core::HRESULT,
+}
+
+impl IMsTscNonScriptable {
+    unsafe fn set_clear_text_password(&self, password: &BSTR) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_clear_text_password)(
+                Interface::as_raw(self),
+                std::mem::transmute_copy(password),
+            )
+            .ok()
+        }
+    }
+}
+
+struct DispatchValue(VARIANT);
+
+impl DispatchValue {
+    fn integer(value: i32) -> Self {
+        let mut variant = VARIANT::default();
+        let inner = unsafe { &mut *variant.Anonymous.Anonymous };
+        inner.vt = VT_I4;
+        inner.Anonymous.lVal = value;
+        Self(variant)
+    }
+
+    fn boolean(value: bool) -> Self {
+        let mut variant = VARIANT::default();
+        let inner = unsafe { &mut *variant.Anonymous.Anonymous };
+        inner.vt = VT_BOOL;
+        inner.Anonymous.boolVal = VARIANT_BOOL(if value { -1 } else { 0 });
+        Self(variant)
+    }
+
+    fn string(value: &str) -> Self {
+        let mut variant = VARIANT::default();
+        let inner = unsafe { &mut *variant.Anonymous.Anonymous };
+        inner.vt = VT_BSTR;
+        inner.Anonymous.bstrVal = ManuallyDrop::new(BSTR::from(value));
+        Self(variant)
+    }
+}
+
+impl Drop for DispatchValue {
+    fn drop(&mut self) {
+        let _ = unsafe { VariantClear(&mut self.0) };
+    }
+}
+
+trait DispatchExt {
+    fn dispatch_id(&self, name: &str) -> windows::core::Result<i32>;
+    fn set_property(&self, name: &str, value: &mut DispatchValue) -> windows::core::Result<()>;
+    fn get_dispatch(&self, names: &[&str]) -> windows::core::Result<IDispatch>;
+    fn invoke_no_args(&self, name: &str) -> windows::core::Result<()>;
+}
+
+impl DispatchExt for IDispatch {
+    fn dispatch_id(&self, name: &str) -> windows::core::Result<i32> {
+        let wide = name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let name = PCWSTR(wide.as_ptr());
+        let mut dispid = 0;
+        unsafe {
+            self.GetIDsOfNames(&GUID::zeroed(), &name, 1, 0, &mut dispid)?;
+        }
+        Ok(dispid)
+    }
+
+    fn set_property(&self, name: &str, value: &mut DispatchValue) -> windows::core::Result<()> {
+        let dispid = self.dispatch_id(name)?;
+        let mut named_argument = DISPID_PROPERTYPUT;
+        let parameters = DISPPARAMS {
+            rgvarg: &mut value.0,
+            rgdispidNamedArgs: &mut named_argument,
+            cArgs: 1,
+            cNamedArgs: 1,
+        };
+        unsafe {
+            self.Invoke(
+                dispid,
+                &GUID::zeroed(),
+                0,
+                DISPATCH_PROPERTYPUT,
+                &parameters,
+                None,
+                None,
+                None,
+            )
+        }
+    }
+
+    fn get_dispatch(&self, names: &[&str]) -> windows::core::Result<IDispatch> {
+        let mut last_error = WinError::from_hresult(E_NOINTERFACE);
+        for name in names {
+            let attempt = (|| {
+                let dispid = self.dispatch_id(name)?;
+                let parameters = DISPPARAMS::default();
+                let mut result = VARIANT::default();
+                unsafe {
+                    self.Invoke(
+                        dispid,
+                        &GUID::zeroed(),
+                        0,
+                        DISPATCH_PROPERTYGET,
+                        &parameters,
+                        Some(&mut result),
+                        None,
+                        None,
+                    )?;
+                    let inner = &mut *result.Anonymous.Anonymous;
+                    if inner.vt != VT_DISPATCH {
+                        let _ = VariantClear(&mut result);
+                        return Err(WinError::from_hresult(E_NOINTERFACE));
+                    }
+                    let dispatch = ManuallyDrop::take(&mut inner.Anonymous.pdispVal)
+                        .ok_or_else(|| WinError::from_hresult(E_NOINTERFACE))?;
+                    inner.vt = VT_EMPTY;
+                    Ok(dispatch)
+                }
+            })();
+            match attempt {
+                Ok(dispatch) => return Ok(dispatch),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    }
+
+    fn invoke_no_args(&self, name: &str) -> windows::core::Result<()> {
+        let dispid = self.dispatch_id(name)?;
+        let parameters = DISPPARAMS::default();
+        unsafe {
+            self.Invoke(
+                dispid,
+                &GUID::zeroed(),
+                0,
+                DISPATCH_METHOD,
+                &parameters,
+                None,
+                None,
+                None,
+            )
+        }
+    }
+}
+
 pub(super) struct ActiveXHost {
     site: ComObject<ActiveXSite>,
     ole_object: IOleObject,
     inplace_object: Option<IOleInPlaceObject>,
     active_object: Option<IOleInPlaceActiveObject>,
-    client: IRemoteDesktopClient,
-    callbacks: Vec<(BSTR, IDispatch)>,
+    client: IDispatch,
+    event_connection: Option<EventConnection>,
     events: Arc<Mutex<Vec<RdpEvent>>>,
     // Must be dropped after every COM interface sourced from mstscax.dll.
     _rdp_module: LoadedModule,
+}
+
+struct EventConnection {
+    point: IConnectionPoint,
+    cookie: u32,
+    _callback: IDispatch,
 }
 
 struct LoadedModule(HMODULE);
@@ -346,6 +531,36 @@ impl Drop for LoadedModule {
     }
 }
 
+fn split_server_port(server: &str) -> (&str, Option<u16>) {
+    if let Some(bracketed) = server.strip_prefix('[')
+        && let Some((host, suffix)) = bracketed.split_once(']')
+    {
+        let port = suffix
+            .strip_prefix(':')
+            .and_then(|value| value.parse::<u16>().ok());
+        return (host, port);
+    }
+    if server.bytes().filter(|byte| *byte == b':').count() == 1
+        && let Some((host, port)) = server.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host, Some(port));
+    }
+    (server, None)
+}
+
+fn set_optional(dispatch: &IDispatch, property: &str, mut value: DispatchValue) {
+    if let Err(error) = dispatch.set_property(property, &mut value) {
+        tracing::debug!(%property, %error, "RDP setting is unavailable on this Windows version");
+    }
+}
+
+fn set_document_bool(dispatch: &IDispatch, property: &str, document: &RdpDocument, key: &str) {
+    if let Some(value) = document.get_integer(key) {
+        set_optional(dispatch, property, DispatchValue::boolean(value != 0));
+    }
+}
+
 impl ActiveXHost {
     fn activate(hwnd: HWND) -> Result<Self> {
         // Never search the application directory for mstscax.dll. Apart from
@@ -353,17 +568,20 @@ impl ActiveXHost {
         // placed next to the executable from shadowing the serviced system copy.
         let rdp_module = LoadedModule::load_system_rdp()?;
         let site = ComObject::new(ActiveXSite { hwnd });
-        let unknown: IUnknown =
-            unsafe { CoCreateInstance(&CLSID_REMOTE_DESKTOP_CLIENT, None, CLSCTX_INPROC_SERVER) }
-                .windows_context(
-                "creating the system RemoteDesktopClient control (mstscax.dll may be unavailable)",
-            )?;
+        let unknown: IUnknown = unsafe {
+            CoCreateInstance(
+                &CLSID_MS_RDP_CLIENT_NOT_SAFE_FOR_SCRIPTING,
+                None,
+                CLSCTX_INPROC_SERVER,
+            )
+        }
+        .windows_context("creating the desktop Remote Desktop ActiveX control")?;
         let ole_object: IOleObject = unknown
             .cast()
             .windows_context("querying the RDP control's IOleObject interface")?;
-        let client: IRemoteDesktopClient = unknown
+        let client: IDispatch = unknown
             .cast()
-            .windows_context("querying the RDP client interface")?;
+            .windows_context("querying the RDP control's automation interface")?;
 
         let client_site = site.to_interface::<IOleClientSite>();
         unsafe {
@@ -404,7 +622,7 @@ impl ActiveXHost {
             active_object: unknown.cast().ok(),
             ole_object,
             client,
-            callbacks: Vec::new(),
+            event_connection: None,
             events: Arc::new(Mutex::new(Vec::new())),
             _rdp_module: rdp_module,
         })
@@ -412,60 +630,256 @@ impl ActiveXHost {
 
     pub fn create(hwnd: HWND, config: &SessionConfig) -> Result<Self> {
         let mut host = Self::activate(hwnd)?;
-
-        let settings = unsafe { host.client.Settings() }
-            .windows_context("opening the RDP settings interface")?;
-        let mut document = config.document.clone();
-        if let Some(password) = config.password.as_ref() {
-            let encrypted = encrypt_password(password.expose())?;
-            document.remove_all("password");
-            document.remove_all("password 51");
-            document.remove_all("WinRTPasswordEncoding");
-            document.remove_all("WinRTEncryptedPassword");
-            document.set_integer("WinRTPasswordEncoding", 1);
-            document.set_string("WinRTEncryptedPassword", encrypted);
-        }
-        let settings_text = BSTR::from(document.render());
-        unsafe { settings.ApplySettings(&settings_text) }
-            .windows_context("applying the merged RDP settings")?;
-
+        host.apply_settings(config)?;
         host.attach_events(hwnd);
         let mut rect = RECT::default();
         unsafe { GetClientRect(hwnd, &mut rect) }
             .windows_context("querying the RDP control area")?;
         host.resize(rect);
-        unsafe { host.client.Connect() }.windows_context("starting the RDP connection")?;
+        host.client
+            .invoke_no_args("Connect")
+            .windows_context("starting the RDP connection")?;
         Ok(host)
     }
 
-    fn attach_events(&mut self, hwnd: HWND) {
-        const EVENTS: &[(&str, RdpEventKind)] = &[
-            ("OnConnecting", RdpEventKind::Connecting),
-            ("OnConnected", RdpEventKind::Connected),
-            ("OnLoginCompleted", RdpEventKind::LoginCompleted),
-            ("OnDisconnected", RdpEventKind::Disconnected),
-            ("OnDialogDisplaying", RdpEventKind::DialogDisplaying),
-            ("OnDialogDismissed", RdpEventKind::DialogDismissed),
-            ("OnNetworkStatusChanged", RdpEventKind::NetworkStatusChanged),
-            (
-                "OnRemoteDesktopSizeChanged",
-                RdpEventKind::RemoteDesktopSizeChanged,
-            ),
-            ("OnStatusChanged", RdpEventKind::StatusChanged),
-        ];
+    fn apply_settings(&self, config: &SessionConfig) -> Result<()> {
+        let server = config.server.as_deref().ok_or_else(|| {
+            crate::error::Error::CommandLine("server address is required".to_owned())
+        })?;
+        let username = config
+            .username
+            .as_deref()
+            .ok_or_else(|| crate::error::Error::CommandLine("user name is required".to_owned()))?;
+        let password = config.password.as_ref().ok_or_else(|| {
+            crate::error::Error::CommandLine(
+                "the desktop ActiveX control requires a password supplied by the user".to_owned(),
+            )
+        })?;
+        let (server, port) = split_server_port(server);
 
-        for (name, kind) in EVENTS {
-            let event_name = BSTR::from(*name);
+        self.client
+            .set_property("Server", &mut DispatchValue::string(server))
+            .windows_context("setting the RDP server address")?;
+        self.client
+            .set_property("UserName", &mut DispatchValue::string(username))
+            .windows_context("setting the RDP user name")?;
+        if let Some(domain) = config.domain.as_deref() {
+            self.client
+                .set_property("Domain", &mut DispatchValue::string(domain))
+                .windows_context("setting the RDP domain")?;
+        }
+
+        let width = config
+            .document
+            .get_integer("desktopwidth")
+            .unwrap_or(1280)
+            .clamp(200, 7680);
+        let height = config
+            .document
+            .get_integer("desktopheight")
+            .unwrap_or(800)
+            .clamp(200, 4320);
+        let color_depth = config
+            .document
+            .get_integer("session bpp")
+            .unwrap_or(32)
+            .clamp(15, 32);
+        self.client
+            .set_property("DesktopWidth", &mut DispatchValue::integer(width))
+            .windows_context("setting the remote desktop width")?;
+        self.client
+            .set_property("DesktopHeight", &mut DispatchValue::integer(height))
+            .windows_context("setting the remote desktop height")?;
+        self.client
+            .set_property("ColorDepth", &mut DispatchValue::integer(color_depth))
+            .windows_context("setting the remote desktop color depth")?;
+        self.client
+            .set_property("FullScreen", &mut DispatchValue::boolean(config.fullscreen))
+            .windows_context("setting full-screen mode")?;
+
+        let non_scriptable: IMsTscNonScriptable = self
+            .client
+            .cast()
+            .windows_context("opening the secure RDP credential interface")?;
+        let password = BSTR::from(password.expose());
+        unsafe { non_scriptable.set_clear_text_password(&password) }
+            .windows_context("passing the password to the system RDP control")?;
+
+        let advanced = self
+            .client
+            .get_dispatch(&[
+                "AdvancedSettings9",
+                "AdvancedSettings8",
+                "AdvancedSettings7",
+                "AdvancedSettings6",
+                "AdvancedSettings5",
+                "AdvancedSettings4",
+                "AdvancedSettings3",
+                "AdvancedSettings2",
+                "AdvancedSettings",
+            ])
+            .windows_context("opening the desktop RDP advanced settings")?;
+
+        if let Some(port) = port {
+            set_optional(
+                &advanced,
+                "RDPPort",
+                DispatchValue::integer(i32::from(port)),
+            );
+        }
+        set_document_bool(
+            &advanced,
+            "RedirectPrinters",
+            &config.document,
+            "redirectprinters",
+        );
+        set_document_bool(
+            &advanced,
+            "RedirectSmartCards",
+            &config.document,
+            "redirectsmartcards",
+        );
+        set_document_bool(
+            &advanced,
+            "RedirectPorts",
+            &config.document,
+            "redirectcomports",
+        );
+        set_document_bool(
+            &advanced,
+            "RedirectClipboard",
+            &config.document,
+            "redirectclipboard",
+        );
+        set_document_bool(
+            &advanced,
+            "AudioCaptureRedirectionMode",
+            &config.document,
+            "audiocapturemode",
+        );
+        set_document_bool(
+            &advanced,
+            "EnableCredSspSupport",
+            &config.document,
+            "enablecredsspsupport",
+        );
+        set_document_bool(
+            &advanced,
+            "ConnectToAdministerServer",
+            &config.document,
+            "administrative session",
+        );
+        if config.dynamic_resolution {
+            set_optional(&advanced, "SmartSizing", DispatchValue::boolean(true));
+        }
+        for (property, key) in [
+            ("AudioRedirectionMode", "audiomode"),
+            ("AuthenticationLevel", "authentication level"),
+            ("PerformanceFlags", "performance flags"),
+        ] {
+            if let Some(value) = config.document.get_integer(key) {
+                set_optional(&advanced, property, DispatchValue::integer(value));
+            }
+        }
+        if let Some(load_balance_info) = config.document.get_string("loadbalanceinfo") {
+            set_optional(
+                &advanced,
+                "LoadBalanceInfo",
+                DispatchValue::string(load_balance_info),
+            );
+        }
+        if let Some(drives) = config.document.get_string("drivestoredirect") {
+            set_optional(
+                &advanced,
+                "RedirectDrives",
+                DispatchValue::boolean(!drives.is_empty()),
+            );
+        }
+
+        self.apply_gateway_settings(config);
+        self.apply_remote_app_settings(config);
+        Ok(())
+    }
+
+    fn apply_gateway_settings(&self, config: &SessionConfig) {
+        let Some(hostname) = config.document.get_string("gatewayhostname") else {
+            return;
+        };
+        let Ok(transport) = self.client.get_dispatch(&[
+            "TransportSettings3",
+            "TransportSettings2",
+            "TransportSettings",
+        ]) else {
+            tracing::warn!("the installed RDP control does not expose RD Gateway settings");
+            return;
+        };
+        set_optional(
+            &transport,
+            "GatewayHostname",
+            DispatchValue::string(hostname),
+        );
+        for (property, key) in [
+            ("GatewayUsageMethod", "gatewayusagemethod"),
+            ("GatewayProfileUsageMethod", "gatewayprofileusagemethod"),
+            ("GatewayCredsSource", "gatewaycredentialssource"),
+        ] {
+            if let Some(value) = config.document.get_integer(key) {
+                set_optional(&transport, property, DispatchValue::integer(value));
+            }
+        }
+    }
+
+    fn apply_remote_app_settings(&self, config: &SessionConfig) {
+        if config.document.get_integer("remoteapplicationmode") != Some(1) {
+            return;
+        }
+        let Ok(remote_program) = self
+            .client
+            .get_dispatch(&["RemoteProgram2", "RemoteProgram"])
+        else {
+            tracing::warn!("the installed RDP control does not expose RemoteApp settings");
+            return;
+        };
+        set_optional(
+            &remote_program,
+            "RemoteProgramMode",
+            DispatchValue::boolean(true),
+        );
+        if let Some(program) = config.document.get_string("remoteapplicationprogram") {
+            set_optional(
+                &remote_program,
+                "RemoteApplicationProgram",
+                DispatchValue::string(program),
+            );
+        }
+        if let Some(arguments) = config.document.get_string("remoteapplicationcmdline") {
+            set_optional(
+                &remote_program,
+                "RemoteApplicationArgs",
+                DispatchValue::string(arguments),
+            );
+        }
+    }
+
+    fn attach_events(&mut self, hwnd: HWND) {
+        let result = (|| {
+            let container: IConnectionPointContainer = self.client.cast()?;
+            let point = unsafe { container.FindConnectionPoint(&DIID_MS_TSC_AX_EVENTS) }?;
             let callback: IDispatch = ComObject::new(EventCallback {
                 hwnd,
-                kind: *kind,
                 events: self.events.clone(),
             })
             .into_interface();
-            match unsafe { self.client.attachEvent(&event_name, &callback) } {
-                Ok(()) => self.callbacks.push((event_name, callback)),
-                Err(error) => tracing::debug!(event = *name, %error, "RDP event is unavailable"),
-            }
+            let cookie = unsafe { point.Advise(&callback) }?;
+            Ok::<_, WinError>(EventConnection {
+                point,
+                cookie,
+                _callback: callback,
+            })
+        })();
+        match result {
+            Ok(connection) => self.event_connection = Some(connection),
+            Err(error) => tracing::debug!(%error, "RDP event connection is unavailable"),
         }
     }
 
@@ -475,10 +889,9 @@ impl ActiveXHost {
         }
     }
 
-    pub fn update_display(&self, width: u32, height: u32) {
-        if width > 0 && height > 0 {
-            let _ = unsafe { self.client.UpdateSessionDisplaySettings(width, height) };
-        }
+    pub fn update_display(&self, _width: u32, _height: u32) {
+        // The desktop ActiveX control resizes with its host. SmartSizing is
+        // enabled for dynamic-resolution configurations in apply_settings.
     }
 
     pub fn translate_accelerator(&self, message: &MSG) -> bool {
@@ -488,7 +901,7 @@ impl ActiveXHost {
     }
 
     pub fn disconnect(&self) {
-        let _ = unsafe { self.client.Disconnect() };
+        let _ = self.client.invoke_no_args("Disconnect");
     }
 
     pub fn take_events(&self) -> Vec<RdpEvent> {
@@ -501,10 +914,10 @@ impl ActiveXHost {
 
 impl Drop for ActiveXHost {
     fn drop(&mut self) {
-        for (name, callback) in self.callbacks.drain(..) {
-            let _ = unsafe { self.client.detachEvent(&name, &callback) };
+        if let Some(connection) = self.event_connection.take() {
+            let _ = unsafe { connection.point.Unadvise(connection.cookie) };
         }
-        let _ = unsafe { self.client.Disconnect() };
+        let _ = self.client.invoke_no_args("Disconnect");
         if let Some(inplace) = &self.inplace_object {
             let _ = unsafe { inplace.UIDeactivate() };
             let _ = unsafe { inplace.InPlaceDeactivate() };
@@ -514,22 +927,6 @@ impl Drop for ActiveXHost {
         // Keep the site alive through SetClientSite(None).
         let _ = &self.site;
     }
-}
-
-fn encrypt_password(password: &str) -> Result<String> {
-    let value = HSTRING::from(password);
-    let buffer = CryptographicBuffer::ConvertStringToBinary(&value, BinaryStringEncoding::Utf16LE)
-        .windows_context("encoding the password")?;
-    let provider = DataProtectionProvider::CreateOverloadExplicit(&HSTRING::from("LOCAL=user"))
-        .windows_context("opening Windows data protection")?;
-    let protected = provider
-        .ProtectAsync(&buffer)
-        .windows_context("starting password protection")?
-        .join()
-        .windows_context("protecting the password for the current Windows user")?;
-    CryptographicBuffer::EncodeToBase64String(&protected)
-        .map(|value| value.to_string())
-        .windows_context("encoding the protected password")
 }
 
 #[cfg(test)]
