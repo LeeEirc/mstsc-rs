@@ -430,6 +430,9 @@ impl ActiveXHost {
             .windows_context("applying the merged RDP settings")?;
 
         host.attach_events(hwnd);
+        let mut rect = RECT::default();
+        unsafe { GetClientRect(hwnd, &mut rect) }
+            .windows_context("querying the RDP control area")?;
         host.resize(rect);
         unsafe { host.client.Connect() }.windows_context("starting the RDP connection")?;
         Ok(host)
