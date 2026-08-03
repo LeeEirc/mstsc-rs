@@ -32,7 +32,8 @@ cargo build --release --target x86_64-pc-windows-msvc
 - 配置覆盖顺序；
 - 缺失字段识别；
 - Windows x64 release 构建和 EXE 冒烟测试；
-- 从 `System32` 加载 `mstscax.dll`，创建 COM 类并执行 OLE 原位激活。
+- 从 `System32` 加载 `mstscax.dll`，创建桌面 COM 类、执行 OLE 原位激活，并验证核心
+  设置和非脚本凭据接口。
 
 自动测试不建立真实 RDP 网络连接。
 
@@ -45,7 +46,7 @@ cargo build --release --target x86_64-pc-windows-msvc
 3. RD Gateway；
 4. RemoteApp 集合；
 5. 双显示器；
-6. 可重定向的打印机、磁盘、智能卡、摄像头和麦克风。
+6. 可重定向的打印机、磁盘、智能卡和麦克风。
 
 建议验证：
 
@@ -82,7 +83,7 @@ SHA256SUMS.txt
 
 ZIP 中包含 EXE、README 和 MIT 许可证。程序不需要复制 `mstscax.dll`，也不能私自
 分发系统 DLL。运行时若系统控件未注册，程序会显示包含创建
-`RemoteDesktopClient` 失败上下文的错误。
+桌面 Remote Desktop ActiveX 控件失败上下文和 HRESULT 的错误。
 
 工作流会核对发布标签与 Cargo 包版本，并全部在 Windows runner 上执行格式、Clippy、
 单元测试、COM 激活测试、EXE 冒烟测试和 SHA-256 生成。普通 CI 构建的 Windows 包也会作为

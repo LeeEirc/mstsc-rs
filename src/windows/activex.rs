@@ -35,11 +35,13 @@ use crate::rdp::RdpDocument;
 
 use super::ui::WM_RDP_EVENT;
 
-// Microsoft RDP Client Control (not safe for scripting), version 9. Microsoft
-// documents this Windows 8.1 class as compatible with later Windows versions.
+// Microsoft RDP Client Control (not safe for scripting). Version 10 is the
+// desktop control for Windows 10/11; version 9 remains a compatible fallback.
 // Unlike CLSID_RemoteDesktopClient, this class is supported in normal desktop
 // processes rather than being restricted to a Store/AppContainer host.
-const CLSID_MS_RDP_CLIENT_NOT_SAFE_FOR_SCRIPTING: GUID =
+const CLSID_MS_RDP_CLIENT_10_NOT_SAFE_FOR_SCRIPTING: GUID =
+    GUID::from_u128(0xa0c63c30_f08d_4ab4_907c_34905d770c7d);
+const CLSID_MS_RDP_CLIENT_9_NOT_SAFE_FOR_SCRIPTING: GUID =
     GUID::from_u128(0x8b918b82_7985_4c24_89df_c33ad2bbfbcd);
 const DIID_MS_TSC_AX_EVENTS: GUID = GUID::from_u128(0x336d5562_efa8_482e_8cb3_c5c0fc7a7db6);
 
@@ -298,8 +300,9 @@ fn legacy_event_kind(dispid: i32) -> Option<RdpEventKind> {
         12 => Some(RdpEventKind::RemoteDesktopSizeChanged),
         18 => Some(RdpEventKind::DialogDisplaying),
         19 => Some(RdpEventKind::DialogDismissed),
-        30 => Some(RdpEventKind::NetworkStatusChanged),
-        32 => Some(RdpEventKind::StatusChanged),
+        29 => Some(RdpEventKind::NetworkStatusChanged),
+        31 => Some(RdpEventKind::Connected),
+        32 => Some(RdpEventKind::Connecting),
         _ => None,
     }
 }
@@ -561,6 +564,23 @@ fn set_document_bool(dispatch: &IDispatch, property: &str, document: &RdpDocumen
     }
 }
 
+fn create_desktop_rdp_control() -> Result<IUnknown> {
+    let mut last_error = None;
+    for clsid in [
+        CLSID_MS_RDP_CLIENT_10_NOT_SAFE_FOR_SCRIPTING,
+        CLSID_MS_RDP_CLIENT_9_NOT_SAFE_FOR_SCRIPTING,
+    ] {
+        match unsafe { CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER) } {
+            Ok(control) => return Ok(control),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(crate::error::Error::Windows {
+        context: "creating the desktop Remote Desktop ActiveX control",
+        source: last_error.unwrap_or_else(|| WinError::from_hresult(E_NOINTERFACE)),
+    })
+}
+
 impl ActiveXHost {
     fn activate(hwnd: HWND) -> Result<Self> {
         // Never search the application directory for mstscax.dll. Apart from
@@ -568,14 +588,7 @@ impl ActiveXHost {
         // placed next to the executable from shadowing the serviced system copy.
         let rdp_module = LoadedModule::load_system_rdp()?;
         let site = ComObject::new(ActiveXSite { hwnd });
-        let unknown: IUnknown = unsafe {
-            CoCreateInstance(
-                &CLSID_MS_RDP_CLIENT_NOT_SAFE_FOR_SCRIPTING,
-                None,
-                CLSCTX_INPROC_SERVER,
-            )
-        }
-        .windows_context("creating the desktop Remote Desktop ActiveX control")?;
+        let unknown = create_desktop_rdp_control()?;
         let ole_object: IOleObject = unknown
             .cast()
             .windows_context("querying the RDP control's IOleObject interface")?;
@@ -769,6 +782,7 @@ impl ActiveXHost {
             &config.document,
             "administrative session",
         );
+        set_document_bool(&advanced, "PublicMode", &config.document, "public mode");
         if config.dynamic_resolution {
             set_optional(&advanced, "SmartSizing", DispatchValue::boolean(true));
         }
@@ -933,21 +947,14 @@ impl Drop for ActiveXHost {
 mod tests {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
-    use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_OVERLAPPED, WS_VISIBLE,
     };
     use windows::core::w;
 
+    use crate::config::{ConnectionOverrides, SecretString, SessionConfig};
+
     use super::ActiveXHost;
-
-    struct WinRtGuard;
-
-    impl Drop for WinRtGuard {
-        fn drop(&mut self) {
-            unsafe { RoUninitialize() };
-        }
-    }
 
     struct OleGuard;
 
@@ -966,14 +973,11 @@ mod tests {
     }
 
     #[test]
-    fn system_rdp_control_can_be_activated() {
+    fn system_rdp_control_can_be_activated_and_configured() {
         // Use a fresh thread so no other test can have selected a conflicting
         // COM apartment model. This is a runtime test, not merely a registry
         // or type check: it executes the same OLE activation as the application.
         std::thread::spawn(|| {
-            unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }
-                .expect("Windows Runtime STA initialization must succeed");
-            let _winrt = WinRtGuard;
             unsafe { OleInitialize(None) }.expect("OLE STA initialization must succeed");
             let _ole = OleGuard;
 
@@ -998,6 +1002,18 @@ mod tests {
 
             let host = ActiveXHost::activate(window.0)
                 .expect("the system Remote Desktop ActiveX control must activate");
+            let config = SessionConfig::resolve(
+                None,
+                ConnectionOverrides {
+                    server: Some("localhost:3389".to_owned()),
+                    username: Some("mstsc-rs-ci".to_owned()),
+                    password: Some(SecretString::new("not-a-real-password")),
+                    ..Default::default()
+                },
+            )
+            .expect("test RDP settings must resolve");
+            host.apply_settings(&config)
+                .expect("the desktop RDP control must accept core settings and credentials");
             drop(host);
             drop(window);
         })

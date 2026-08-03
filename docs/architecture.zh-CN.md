@@ -20,20 +20,19 @@ Win32 主窗口 ── OLE ActiveX 容器 ── mstscax.dll
                                  RDP / RemoteApp
 ```
 
-程序使用系统注册的 `CLSID_RemoteDesktopClient`
-(`EAB16C5D-EED1-4E95-868B-0FBA1B42C092`)。这个类由 `mstscax.dll` 实现，因此
-Windows 更新 RDP 控件时程序自动使用系统版本，无需捆绑或注册 OCX。
+程序优先使用系统注册的 `CLSID_MsRdpClient10NotSafeForScripting`
+(`A0C63C30-F08D-4AB4-907C-34905D770C7D`)，并以版本 9 控件作为回退。它们由
+`System32\\mstscax.dll` 实现，明确用于 Windows 桌面应用。
 
-选择 `IRemoteDesktopClient` 的关键原因是其
-`IRemoteDesktopClientSettings::ApplySettings` 接口能接收完整 `.rdp` 内容。相比逐个
-调用旧式 `IMsRdpClientAdvancedSettings*` 属性，这种方式不会在 Rust 代码里人为缩小
-RDP 属性范围，更适合“保留未知项并尽量让系统识别”的目标。
+初版使用的 `CLSID_RemoteDesktopClient`
+(`EAB16C5D-EED1-4E95-868B-0FBA1B42C092`) 是 Store/AppContainer 客户端类；普通桌面
+进程在 Windows 上创建它会返回 `E_ACCESSDENIED (0x80070005)`。因此当前实现使用桌面
+非脚本控件，通过 `IDispatch`、高级设置、传输设置和非脚本凭据接口应用配置。
 
 相关微软文档：
 
-- [RemoteDesktopClient class](https://learn.microsoft.com/en-us/windows/win32/termserv/remotedesktopclient)
-- [IRemoteDesktopClientSettings](https://learn.microsoft.com/en-us/windows/win32/api/rdpappcontainerclient/nn-rdpappcontainerclient-iremotedesktopclientsettings)
-- [ApplySettings](https://learn.microsoft.com/en-us/previous-versions/hh448591(v=vs.85))
+- [MsRdpClient10NotSafeForScripting class](https://learn.microsoft.com/en-us/windows/win32/termserv/msrdpclient10notsafeforscripting)
+- [IMsRdpClient10](https://learn.microsoft.com/en-us/windows/win32/termserv/imsrdpclient10)
 - [Remote Desktop ActiveX interfaces](https://learn.microsoft.com/en-us/windows/win32/termserv/remote-desktop-web-connection-reference)
 
 ## 2. Rust 模块
@@ -44,7 +43,7 @@ RDP 属性范围，更适合“保留未知项并尽量让系统识别”的目�
 | `config` | 默认值、RDP 文件、CLI 和交互输入的合并 | 跨平台 |
 | `cli` | GNU 参数及 `mstsc.exe` 斜杠参数兼容 | 跨平台 |
 | `windows::ui` | Win32 窗口、补全表单、消息循环、生命周期 | Windows |
-| `windows::activex` | OLE 容器、RDP 控件、设置、事件、密码保护 | Windows |
+| `windows::activex` | OLE 容器、桌面 RDP 控件、设置映射、事件、凭据传递 | Windows |
 
 公开库接口位于 `mstsc_rs`：
 
@@ -80,18 +79,17 @@ ActiveX 不是普通子窗口。宿主实现以下 OLE 接口：
 创建顺序：
 
 1. 将线程初始化为 STA，并初始化 OLE；
-2. `CoCreateInstance(CLSID_RemoteDesktopClient, CLSCTX_INPROC_SERVER)`；
-3. 查询 `IOleObject` 和 `IRemoteDesktopClient`；
-4. `IOleObject::SetClientSite`；
-5. `OleSetContainedObject`；
+2. 仅从 `System32` 加载 `mstscax.dll`；
+3. `CoCreateInstance(CLSID_MsRdpClient10NotSafeForScripting, ...)`，必要时回退版本 9；
+4. 查询 `IOleObject` 和 `IDispatch`；
+5. `IOleObject::SetClientSite` 和 `OleSetContainedObject`；
 6. `IOleObject::DoVerb(OLEIVERB_INPLACEACTIVATE)`；
-7. 取得 `IRemoteDesktopClientSettings` 并 `ApplySettings`；
-8. 附加事件回调；
-9. `IRemoteDesktopClient::Connect`。
+7. 通过自动化接口、高级设置和传输设置应用已映射属性；
+8. 通过 `IMsTscNonScriptable` 设置密码；
+9. 通过连接点附加事件回调并调用 `Connect`。
 
 窗口尺寸变化时调用 `IOleInPlaceObject::SetObjectRects`。启用
-`dynamic resolution:i:1` 后，同时调用
-`IRemoteDesktopClient::UpdateSessionDisplaySettings`。
+`dynamic resolution:i:1` 后，桌面控件使用 `SmartSizing` 随宿主区域缩放。
 
 消息循环先把键盘消息交给 `IOleInPlaceActiveObject::TranslateAccelerator`，确保
 远程桌面的组合键和 ActiveX 内部导航正常工作。
@@ -103,21 +101,20 @@ ActiveX 不是普通子窗口。宿主实现以下 OLE 接口：
 3. UI/In-place deactivate；
 4. `IOleObject::Close(OLECLOSE_NOSAVE)`；
 5. 清空 client site；
-6. 释放 COM 对象并反初始化 OLE/WinRT。
+6. 释放 COM 对象并反初始化 OLE。
 
 ## 4. 事件
 
-程序订阅：
+程序通过 `DIID_IMsTscAxEvents` 连接点接收：
 
 - `OnConnecting`
 - `OnConnected`
-- `OnLoginCompleted`
+- `OnLoginComplete`
 - `OnDisconnected`
-- `OnDialogDisplaying`
-- `OnDialogDismissed`
+- 身份验证警告显示/关闭事件
 - `OnNetworkStatusChanged`
-- `OnRemoteDesktopSizeChanged`
-- `OnStatusChanged`
+- `OnRemoteDesktopSizeChange`
+- 自动重连事件
 
 回调对象实现 `IDispatch`，把事件投递回主窗口线程。连接状态用于窗口标题和日志；
 断开参数用于诊断。证书、凭据和重定向警告对话框由系统控件显示，宿主不替换或自动
@@ -132,20 +129,11 @@ ActiveX 不是普通子窗口。宿主实现以下 OLE 接口：
 3. 默认环境变量 `MSTSC_RS_PASSWORD`
 4. Win32 补全界面
 
-明文密码不会加入普通 `.rdp` 文本。连接前使用 Windows
-`DataProtectionProvider("LOCAL=user")` 保护，并按微软要求设置：
-
-```text
-WinRTPasswordEncoding:i:1
-WinRTEncryptedPassword:s:<base64>
-```
-
-`1` 表示 UTF-16LE。保护后的数据只对当前 Windows 用户有效。控件复制设置后，程序
-立即销毁密码编辑框并清除 `SecretString`；但命令行密码仍可能被进程查看工具或 shell
+明文密码不会加入普通 `.rdp` 文本。连接前通过桌面控件的
+`IMsTscNonScriptable::ClearTextPassword` 写入；这是非脚本 COM 接口，密码不会经过
+`IDispatch` 或写回配置文件。控件复制凭据后，程序立即销毁密码编辑框并清除
+`SecretString`；但命令行密码仍可能被进程查看工具或 shell
 历史捕获，因此环境变量方式更合适。
-
-微软接口要求见
-[SetRdpProperty](https://learn.microsoft.com/en-us/windows/win32/api/rdpappcontainerclient/nf-rdpappcontainerclient-iremotedesktopclientsettings-setrdpproperty)。
 
 ## 6. 安全对话框
 

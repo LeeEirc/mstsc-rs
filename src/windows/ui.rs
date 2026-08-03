@@ -3,7 +3,6 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM}
 use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush, UpdateWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
-use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
@@ -45,14 +44,6 @@ struct OleGuard;
 impl Drop for OleGuard {
     fn drop(&mut self) {
         unsafe { OleUninitialize() };
-    }
-}
-
-struct WinRtGuard;
-
-impl Drop for WinRtGuard {
-    fn drop(&mut self) {
-        unsafe { RoUninitialize() };
     }
 }
 
@@ -253,7 +244,7 @@ impl AppState {
         match ActiveXHost::create(self.hwnd, &self.config) {
             Ok(host) => {
                 self.active = Some(host);
-                // The control has copied/encrypted all credentials. Remove the
+                // The control has copied the credentials. Remove the
                 // clear-text copies retained by our config and edit control.
                 self.config.password.take();
                 self.form.take();
@@ -376,9 +367,6 @@ impl AppState {
 
 pub(super) fn run(config: SessionConfig) -> Result<()> {
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }
-        .windows_context("initializing the Windows Runtime apartment")?;
-    let _winrt = WinRtGuard;
     unsafe { OleInitialize(None) }.windows_context("initializing OLE")?;
     let _ole = OleGuard;
 

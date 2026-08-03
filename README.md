@@ -11,13 +11,13 @@ COM 组件。
 
 - 读取 UTF-8、UTF-8 BOM、UTF-16 LE/BE `.rdp` 文件；
 - 保留未知属性、未知类型、注释、空行、重复项和未修改行；
-- 将合并后的完整 RDP 设置流交给系统控件，Windows 支持的磁盘、打印机、剪贴板、
-  智能卡、摄像头、麦克风、WebAuthn、位置、音频、Gateway、多显示器和 RemoteApp
-  设置均可生效；
-- 兼容 `/v:`、`/f`、`/multimon`、`/span`、`/w:`、`/h:`、`/admin`、
-  `/public`、`/restrictedAdmin`、`/remoteGuard`；
+- 将合并后的常用 RDP 设置映射到 Windows 桌面 ActiveX 控件，覆盖显示、打印机、
+  剪贴板、智能卡、麦克风、音频、Gateway 和 RemoteApp；
+- 兼容 `/v:`、`/f`、`/w:`、`/h:`、`/admin` 和 `/public`；其他已解析但尚未映射的
+  `mstsc.exe` 开关会保留在 dry-run 设置文本中；
 - GNU 风格参数覆盖 `.rdp`，并可用 `--set name:type:value` 设置任意 RDP 属性；
-- 支持 `--password`、`--password-env` 和默认的 `MSTSC_RS_PASSWORD`；
+- 支持 `--password`、`--password-env` 和默认的 `MSTSC_RS_PASSWORD`，并通过非脚本
+  COM 凭据接口传给系统控件；
 - 参数缺少服务器、用户名或密码时显示 Win32 原生补全界面；
 - 保留系统证书、身份和本地资源重定向安全提示，不提供静默忽略证书的选项；
 - 一个进程、一个窗口、一个 RDP 会话；
@@ -53,7 +53,7 @@ mstsc-rs.exe host.rdp `
   --redirect-microphone true
 ```
 
-任意属性覆盖：
+属性覆盖（运行时是否生效取决于桌面 ActiveX 接口是否映射该属性）：
 
 ```powershell
 mstsc-rs.exe host.rdp `
@@ -113,7 +113,6 @@ target/x86_64-pc-windows-msvc/release/mstsc-rs.exe
 
 ## 能力边界
 
-这里的“完整 RDP”指完整使用当前 Windows 系统控件所暴露的客户端能力，不是重新实现
-微软私有客户端的每一项内部行为。最终可用能力仍受客户端 Windows 版本、远端服务器
-版本、组策略、RD Gateway 策略和设备驱动限制。Windows 不认识的未来属性仍会由解析器
-保留，但系统控件可能忽略它们。
+程序不重新实现微软私有 RDP 协议栈。最终可用能力受客户端 Windows 版本、远端服务器
+版本、组策略、RD Gateway 策略和设备驱动限制。解析器会保留未知或尚未映射的属性，
+`--dry-run` 也会显示它们，但桌面 ActiveX 控件不会自动应用尚未映射的字段。
