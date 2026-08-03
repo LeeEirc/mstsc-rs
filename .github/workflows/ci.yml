@@ -41,10 +41,30 @@ jobs:
         run: cargo fmt --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        shell: pwsh
+        run: |
+          $output = cargo clippy --locked --all-targets -- -D warnings 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | Write-Output
+          if ($exitCode -ne 0) {
+            $details = $output -join "`n"
+            $escaped = $details.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Output "::error title=Windows Clippy failed::$escaped"
+            exit $exitCode
+          }
 
       - name: Run unit tests
-        run: cargo test --locked --all-targets
+        shell: pwsh
+        run: |
+          $output = cargo test --locked --all-targets 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | Write-Output
+          if ($exitCode -ne 0) {
+            $details = $output -join "`n"
+            $escaped = $details.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Output "::error title=Windows tests failed::$escaped"
+            exit $exitCode
+          }
 
       - name: Build release executable
         run: cargo build --locked --release --target x86_64-pc-windows-msvc
