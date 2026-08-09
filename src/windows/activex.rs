@@ -3,8 +3,8 @@ use std::mem::{ManuallyDrop, size_of};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{
-    DISP_E_UNKNOWNNAME, E_NOINTERFACE, E_NOTIMPL, FreeLibrary, HMODULE, HWND, LPARAM, RECT, SIZE,
-    VARIANT_BOOL, WPARAM,
+    DISP_E_UNKNOWNNAME, E_NOINTERFACE, E_NOTIMPL, FreeLibrary, HMODULE, HWND, LPARAM, RECT, S_OK,
+    SIZE, VARIANT_BOOL, WPARAM,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CoCreateInstance, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
@@ -908,9 +908,16 @@ impl ActiveXHost {
     }
 
     pub fn translate_accelerator(&self, message: &MSG) -> bool {
-        self.active_object
-            .as_ref()
-            .is_some_and(|active| unsafe { active.TranslateAccelerator(Some(message)) }.is_ok())
+        self.active_object.as_ref().is_some_and(|active| {
+            // The generated wrapper turns both S_OK and S_FALSE into Ok(()),
+            // but OLE defines only S_OK as "message handled". Calling the
+            // vtable directly preserves S_FALSE so ordinary window, paint and
+            // posted RDP-event messages continue through DispatchMessageW.
+            let result = unsafe {
+                (Interface::vtable(active).TranslateAccelerator)(Interface::as_raw(active), message)
+            };
+            accelerator_was_handled(result)
+        })
     }
 
     pub fn disconnect(&self) {
@@ -923,6 +930,10 @@ impl ActiveXHost {
             .map(|mut events| std::mem::take(&mut *events))
             .unwrap_or_default()
     }
+}
+
+fn accelerator_was_handled(result: HRESULT) -> bool {
+    result == S_OK
 }
 
 impl Drop for ActiveXHost {
@@ -944,7 +955,7 @@ impl Drop for ActiveXHost {
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{E_FAIL, HWND, S_FALSE, S_OK};
     use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_OVERLAPPED, WS_VISIBLE,
@@ -953,7 +964,7 @@ mod tests {
 
     use crate::config::{ConnectionOverrides, SecretString, SessionConfig};
 
-    use super::ActiveXHost;
+    use super::{ActiveXHost, accelerator_was_handled};
 
     struct OleGuard;
 
@@ -969,6 +980,13 @@ mod tests {
         fn drop(&mut self) {
             let _ = unsafe { DestroyWindow(self.0) };
         }
+    }
+
+    #[test]
+    fn accelerator_only_consumes_messages_reported_as_handled() {
+        assert!(accelerator_was_handled(S_OK));
+        assert!(!accelerator_was_handled(S_FALSE));
+        assert!(!accelerator_was_handled(E_FAIL));
     }
 
     #[test]
