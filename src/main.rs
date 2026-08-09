@@ -29,14 +29,5 @@ fn run() -> mstsc_rs::Result<()> {
         return Ok(());
     }
 
-    #[cfg(windows)]
-    {
-        mstsc_rs::windows::run(config)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = config;
-        Err(mstsc_rs::Error::UnsupportedPlatform)
-    }
+    mstsc_rs::windows::run(config)
 }

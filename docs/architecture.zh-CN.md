@@ -39,9 +39,9 @@ Win32 主窗口 ── OLE ActiveX 容器 ── mstscax.dll
 
 | 模块 | 职责 | 平台 |
 |---|---|---|
-| `rdp` | 编码识别、逐行解析、未知项保留、属性覆盖、重新编码 | 跨平台 |
-| `config` | 默认值、RDP 文件、CLI 和交互输入的合并 | 跨平台 |
-| `cli` | GNU 参数及 `mstsc.exe` 斜杠参数兼容 | 跨平台 |
+| `rdp` | 编码识别、逐行解析、未知项保留、属性覆盖、重新编码 | Windows |
+| `config` | 默认值、RDP 文件、CLI 和交互输入的合并 | Windows |
+| `cli` | GNU 参数及 `mstsc.exe` 斜杠参数兼容 | Windows |
 | `windows::ui` | Win32 窗口、补全表单、消息循环、生命周期 | Windows |
 | `windows::activex` | OLE 容器、桌面 RDP 控件、设置映射、事件、凭据传递 | Windows |
 
@@ -60,7 +60,6 @@ let overrides = ConnectionOverrides {
 
 let config = SessionConfig::resolve(Some("base.rdp".into()), overrides)?;
 
-#[cfg(windows)]
 mstsc_rs::windows::run(config)?;
 ```
 

@@ -75,21 +75,21 @@ mstsc-rs.exe host.rdp /f --set "redirectclipboard:i:0" --dry-run
 
 ## 构建
 
-Windows MSVC：
+在 Windows PowerShell 中使用本机 MSVC 工具链构建：
 
 ```powershell
-cargo build --release --target x86_64-pc-windows-msvc
+cargo build --release
 ```
 
 产物位于：
 
 ```text
-target/x86_64-pc-windows-msvc/release/mstsc-rs.exe
+target/release/mstsc-rs.exe
 ```
 
-项目不使用 Linux 交叉构建发布文件。ActiveX 控件的加载和原位激活会在 GitHub Actions
-的 Windows runner 上实际执行；证书对话框、设备重定向和真实 RDP 连接仍需在 Windows
-10/11 环境中手工集成测试。
+项目只支持在 Windows 上本机构建和运行。ActiveX 控件的加载和原位激活会在 GitHub
+Actions 的 Windows runner 上实际执行；证书对话框、设备重定向和真实 RDP 连接仍需在
+Windows 10/11 环境中手工集成测试。
 
 ## 下载与发布
 

@@ -67,10 +67,10 @@ jobs:
           }
 
       - name: Build release executable
-        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+        run: cargo build --locked --release
 
       - name: Smoke-test executable
-        run: target\x86_64-pc-windows-msvc\release\mstsc-rs.exe --version
+        run: target\release\mstsc-rs.exe --version
 
       - name: Package release files
         shell: pwsh
@@ -82,7 +82,7 @@ jobs:
 
           New-Item -ItemType Directory -Force "dist/package" | Out-Null
           New-Item -ItemType Directory -Force "dist/release" | Out-Null
-          Copy-Item "target/x86_64-pc-windows-msvc/release/mstsc-rs.exe" "dist/package/"
+          Copy-Item "target/release/mstsc-rs.exe" "dist/package/"
           Copy-Item "README.md", "LICENSE" "dist/package/"
           Copy-Item "dist/package/mstsc-rs.exe" "dist/release/"
           Compress-Archive -Path "dist/package/*" -DestinationPath "dist/release/$packageName.zip"

@@ -25,10 +25,6 @@ pub enum Error {
     #[error("environment variable `{0}` contains non-Unicode password data")]
     NonUnicodePasswordEnvironment(String),
 
-    #[error("Windows RDP hosting is unavailable on this target")]
-    UnsupportedPlatform,
-
-    #[cfg(windows)]
     #[error("Windows API error while {context}: {source}")]
     Windows {
         context: &'static str,
@@ -39,12 +35,10 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[cfg(windows)]
 pub(crate) trait WindowsContext<T> {
     fn windows_context(self, context: &'static str) -> Result<T>;
 }
 
-#[cfg(windows)]
 impl<T> WindowsContext<T> for windows::core::Result<T> {
     fn windows_context(self, context: &'static str) -> Result<T> {
         self.map_err(|source| Error::Windows { context, source })

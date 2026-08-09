@@ -3,13 +3,13 @@
 ## 工具链
 
 - Rust `1.97.1`（由 `rust-toolchain.toml` 固定）
-- 目标 `x86_64-pc-windows-msvc`
+- Windows x64 MSVC 本机工具链
 - Windows 10/11 x64 运行环境
 
 选择 MSVC ABI 是因为系统 ActiveX/COM、Windows SDK 导入库和部署环境都以官方 MSVC
-ABI 为基准。项目只在 Windows 本机和 GitHub Actions Windows runner 构建，不使用
-Linux 交叉构建。`.cargo/config.toml` 启用 `+crt-static`，将 MSVC CRT 静态链接到 EXE；
-运行时只依赖 Windows 自带的系统 DLL 和已注册的 `mstscax.dll`。
+ABI 为基准。项目只在 Windows 本机和 GitHub Actions Windows runner 构建和运行，
+不提供其他宿主平台的构建路径。运行时依赖 Windows 自带的系统 DLL 和已注册的
+`mstscax.dll`。
 
 ## Windows 原生构建
 
@@ -18,7 +18,7 @@ Linux 交叉构建。`.cargo/config.toml` 启用 `+crt-static`，将 MSVC CRT �
 ```powershell
 rustup show
 cargo test --all-targets
-cargo build --release --target x86_64-pc-windows-msvc
+cargo build --release
 ```
 
 ## 测试层次
