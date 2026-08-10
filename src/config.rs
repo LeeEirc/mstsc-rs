@@ -104,7 +104,10 @@ impl SessionConfig {
             .filter(|value| !value.trim().is_empty());
         let has_embedded_password =
             document.contains("password 51") || document.contains("password");
-        let dynamic_resolution = document.get_integer("dynamic resolution") == Some(1);
+        // Windows' RDP clients default to following the local window size when
+        // the property is absent. Preserve an explicit opt-out from an .rdp
+        // file, but make ordinary sessions responsive by default.
+        let dynamic_resolution = document.get_integer("dynamic resolution") != Some(0);
         let fullscreen = document.get_integer("screen mode id") == Some(2);
         let title = overrides.title.unwrap_or_else(|| match server.as_deref() {
             Some(server) => format!("{server} - mstsc-rs"),
@@ -160,6 +163,7 @@ impl SessionConfig {
 fn default_document() -> RdpDocument {
     let mut document = RdpDocument::default();
     document.set_integer("screen mode id", 1);
+    document.set_integer("dynamic resolution", 1);
     document.set_integer("session bpp", 32);
     document.set_integer("compression", 1);
     document.set_integer("networkautodetect", 1);
@@ -297,5 +301,23 @@ mod tests {
         };
         let config = SessionConfig::resolve(None, overrides).unwrap();
         assert!(config.needs_interactive_input());
+    }
+
+    #[test]
+    fn dynamic_resolution_defaults_on_and_can_be_disabled() {
+        let defaults = SessionConfig::resolve(None, ConnectionOverrides::default()).unwrap();
+        assert!(defaults.dynamic_resolution);
+        assert_eq!(defaults.document.get_integer("dynamic resolution"), Some(1));
+
+        let disabled = SessionConfig::resolve(
+            None,
+            ConnectionOverrides {
+                dynamic_resolution: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!disabled.dynamic_resolution);
+        assert_eq!(disabled.document.get_integer("dynamic resolution"), Some(0));
     }
 }

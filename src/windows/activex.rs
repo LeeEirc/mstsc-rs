@@ -360,6 +360,7 @@ impl IMsTscNonScriptable {
     }
 }
 
+#[repr(transparent)]
 struct DispatchValue(VARIANT);
 
 impl DispatchValue {
@@ -368,6 +369,14 @@ impl DispatchValue {
         let inner = unsafe { &mut *variant.Anonymous.Anonymous };
         inner.vt = VT_I4;
         inner.Anonymous.lVal = value;
+        Self(variant)
+    }
+
+    fn unsigned(value: u32) -> Self {
+        let mut variant = VARIANT::default();
+        let inner = unsafe { &mut *variant.Anonymous.Anonymous };
+        inner.vt = VT_UI4;
+        inner.Anonymous.ulVal = value;
         Self(variant)
     }
 
@@ -399,6 +408,11 @@ trait DispatchExt {
     fn set_property(&self, name: &str, value: &mut DispatchValue) -> windows::core::Result<()>;
     fn get_dispatch(&self, names: &[&str]) -> windows::core::Result<IDispatch>;
     fn invoke_no_args(&self, name: &str) -> windows::core::Result<()>;
+    fn invoke_with_arguments(
+        &self,
+        name: &str,
+        arguments: Vec<DispatchValue>,
+    ) -> windows::core::Result<()>;
 }
 
 impl DispatchExt for IDispatch {
@@ -491,6 +505,91 @@ impl DispatchExt for IDispatch {
             )
         }
     }
+
+    fn invoke_with_arguments(
+        &self,
+        name: &str,
+        mut arguments: Vec<DispatchValue>,
+    ) -> windows::core::Result<()> {
+        let dispid = self.dispatch_id(name)?;
+        // IDispatch stores positional arguments right-to-left.
+        arguments.reverse();
+        let parameters = DISPPARAMS {
+            rgvarg: arguments
+                .first_mut()
+                .map_or(std::ptr::null_mut(), |value| &mut value.0),
+            cArgs: arguments.len() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            self.Invoke(
+                dispid,
+                &GUID::zeroed(),
+                0,
+                DISPATCH_METHOD,
+                &parameters,
+                None,
+                None,
+                None,
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SessionDisplaySettings {
+    width: u32,
+    height: u32,
+    physical_width: u32,
+    physical_height: u32,
+    desktop_scale_factor: u32,
+    device_scale_factor: u32,
+}
+
+impl SessionDisplaySettings {
+    fn from_window(width: u32, height: u32, dpi: u32, document: &RdpDocument) -> Self {
+        let width = width.clamp(200, 8192);
+        let height = height.clamp(200, 8192);
+        let dpi = dpi.max(96);
+        let desktop_scale_factor = document
+            .get_integer("desktopscalefactor")
+            .filter(|value| (100..=500).contains(value))
+            .map(|value| value as u32)
+            .unwrap_or_else(|| ((dpi.saturating_mul(100) + 48) / 96).clamp(100, 500));
+        let device_scale_factor = document
+            .get_integer("devicescalefactor")
+            .filter(|value| matches!(value, 100 | 140 | 180))
+            .map(|value| value as u32)
+            .unwrap_or(100);
+
+        Self {
+            width,
+            height,
+            physical_width: pixels_to_millimeters(width, dpi),
+            physical_height: pixels_to_millimeters(height, dpi),
+            desktop_scale_factor,
+            device_scale_factor,
+        }
+    }
+
+    fn arguments(self) -> Vec<DispatchValue> {
+        vec![
+            DispatchValue::unsigned(self.width),
+            DispatchValue::unsigned(self.height),
+            DispatchValue::unsigned(self.physical_width),
+            DispatchValue::unsigned(self.physical_height),
+            DispatchValue::unsigned(0), // landscape orientation
+            DispatchValue::unsigned(self.desktop_scale_factor),
+            DispatchValue::unsigned(self.device_scale_factor),
+        ]
+    }
+}
+
+fn pixels_to_millimeters(pixels: u32, dpi: u32) -> u32 {
+    // 1 inch = 25.4 mm. Keep the monitor attributes inside the ranges
+    // accepted by the RDP display-control virtual channel.
+    (((u64::from(pixels) * 254 + u64::from(dpi) * 5) / (u64::from(dpi) * 10)) as u32)
+        .clamp(10, 10_000)
 }
 
 pub(super) struct ActiveXHost {
@@ -782,9 +881,14 @@ impl ActiveXHost {
             "administrative session",
         );
         set_document_bool(&advanced, "PublicMode", &config.document, "public mode");
-        if config.dynamic_resolution {
-            set_optional(&advanced, "SmartSizing", DispatchValue::boolean(true));
-        }
+        // SmartSizing is the visual fallback for servers that do not support
+        // live display updates. It also keeps the old framebuffer fitted while
+        // a resize update is in flight.
+        set_optional(
+            &advanced,
+            "SmartSizing",
+            DispatchValue::boolean(config.dynamic_resolution),
+        );
         for (property, key) in [
             ("AudioRedirectionMode", "audiomode"),
             ("AuthenticationLevel", "authentication level"),
@@ -902,9 +1006,19 @@ impl ActiveXHost {
         }
     }
 
-    pub fn update_display(&self, _width: u32, _height: u32) {
-        // The desktop ActiveX control resizes with its host. SmartSizing is
-        // enabled for dynamic-resolution configurations in apply_settings.
+    pub fn update_display(&self, width: u32, height: u32, dpi: u32, document: &RdpDocument) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let settings = SessionDisplaySettings::from_window(width, height, dpi, document);
+        if let Err(error) = self
+            .client
+            .invoke_with_arguments("UpdateSessionDisplaySettings", settings.arguments())
+        {
+            // SmartSizing remains enabled, so older servers and controls still
+            // resize cleanly without exposing scroll bars or clipped content.
+            tracing::debug!(%error, "live RDP display update is unavailable; using SmartSizing");
+        }
     }
 
     pub fn translate_accelerator(&self, message: &MSG) -> bool {
@@ -963,8 +1077,9 @@ mod tests {
     use windows::core::w;
 
     use crate::config::{ConnectionOverrides, SecretString, SessionConfig};
+    use crate::rdp::RdpDocument;
 
-    use super::{ActiveXHost, accelerator_was_handled};
+    use super::{ActiveXHost, DispatchExt, SessionDisplaySettings, accelerator_was_handled};
 
     struct OleGuard;
 
@@ -987,6 +1102,23 @@ mod tests {
         assert!(accelerator_was_handled(S_OK));
         assert!(!accelerator_was_handled(S_FALSE));
         assert!(!accelerator_was_handled(E_FAIL));
+    }
+
+    #[test]
+    fn display_settings_follow_window_size_and_dpi() {
+        let settings = SessionDisplaySettings::from_window(50, 9_000, 144, &RdpDocument::default());
+        assert_eq!(settings.width, 200);
+        assert_eq!(settings.height, 8_192);
+        assert_eq!(settings.desktop_scale_factor, 150);
+        assert_eq!(settings.device_scale_factor, 100);
+        assert!((10..=10_000).contains(&settings.physical_width));
+        assert!((10..=10_000).contains(&settings.physical_height));
+
+        let document =
+            RdpDocument::parse("desktopscalefactor:i:175\r\ndevicescalefactor:i:140\r\n");
+        let configured = SessionDisplaySettings::from_window(1_280, 720, 96, &document);
+        assert_eq!(configured.desktop_scale_factor, 175);
+        assert_eq!(configured.device_scale_factor, 140);
     }
 
     #[test]
@@ -1019,6 +1151,9 @@ mod tests {
 
             let host = ActiveXHost::activate(window.0)
                 .expect("the system Remote Desktop ActiveX control must activate");
+            host.client
+                .dispatch_id("UpdateSessionDisplaySettings")
+                .expect("the version 9/10 RDP control must expose live display updates");
             let config = SessionConfig::resolve(
                 None,
                 ConnectionOverrides {

@@ -22,7 +22,7 @@
 |---|---|
 | 窗口/全屏 | `screen mode id` |
 | 尺寸 | `desktopwidth`、`desktopheight` |
-| 动态缩放 | `dynamic resolution` + `SmartSizing` |
+| 自适应窗口 | `dynamic resolution` + `UpdateSessionDisplaySettings`，不支持时回退 `SmartSizing` |
 | 剪贴板 | `redirectclipboard` |
 | 打印机 | `redirectprinters` |
 | 磁盘 | `drivestoredirect` |
@@ -41,6 +41,7 @@
 
 ```text
 screen mode id:i:1
+dynamic resolution:i:1
 session bpp:i:32
 compression:i:1
 networkautodetect:i:1
@@ -54,6 +55,9 @@ redirectsmartcards:i:1
 audiomode:i:0
 audiocapturemode:i:1
 ```
+
+窗口化会话默认跟随客户区尺寸调整远端分辨率，并沿用当前显示器 DPI；服务器不支持动态
+分辨率时会自动缩放到窗口内。`.rdp` 中显式设置 `dynamic resolution:i:0` 可关闭此行为。
 
 磁盘不会在无配置时默认开放。USB、摄像头和任意动态设备属性目前会被解析器保留，
 但尚未映射到桌面控件接口。安全对话框仍会按 Windows 当前策略显示已请求的本地资源。

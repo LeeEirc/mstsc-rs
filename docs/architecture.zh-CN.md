@@ -87,8 +87,10 @@ ActiveX 不是普通子窗口。宿主实现以下 OLE 接口：
 8. 通过 `IMsTscNonScriptable` 设置密码；
 9. 通过连接点附加事件回调并调用 `Connect`。
 
-窗口尺寸变化时调用 `IOleInPlaceObject::SetObjectRects`。启用
-`dynamic resolution:i:1` 后，桌面控件使用 `SmartSizing` 随宿主区域缩放。
+窗口尺寸变化时立即调用 `IOleInPlaceObject::SetObjectRects`，并对连续的 `WM_SIZE` 做短暂
+防抖。启用 `dynamic resolution:i:1`（默认）后，通过
+`IMsRdpClient9::UpdateSessionDisplaySettings` 更新远端分辨率和 DPI；`SmartSizing` 在更新期间
+保持画面贴合窗口，并作为旧服务器不支持动态分辨率时的兼容回退。
 
 消息循环先把键盘消息交给 `IOleInPlaceActiveObject::TranslateAccelerator`，确保
 远程桌面的组合键和 ActiveX 内部导航正常工作。

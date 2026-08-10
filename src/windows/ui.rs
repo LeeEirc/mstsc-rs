@@ -4,19 +4,20 @@ use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush, UpdateWindow
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
     DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_PASSWORD, GWLP_USERDATA,
     GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU,
-    IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW, MoveWindow,
-    PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SetWindowLongPtrW,
-    SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_SIZE, WNDCLASSW, WS_CAPTION,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE,
+    IDC_ARROW, KillTimer, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SetTimer,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE, WM_NCDESTROY,
+    WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{Error as WinError, HSTRING, PCWSTR, w};
 
@@ -33,6 +34,8 @@ const ID_USERNAME: isize = 1002;
 const ID_DOMAIN: isize = 1003;
 const ID_PASSWORD: isize = 1004;
 const ID_CONNECT: usize = 1005;
+const DISPLAY_RESIZE_TIMER: usize = 1;
+const DISPLAY_RESIZE_DELAY_MS: u32 = 150;
 
 const LABEL_WIDTH: i32 = 100;
 const EDIT_WIDTH: i32 = 390;
@@ -196,6 +199,7 @@ struct AppState {
     config: SessionConfig,
     form: Option<ConfigForm>,
     active: Option<ActiveXHost>,
+    session_ready: bool,
 }
 
 struct CreationContext {
@@ -210,6 +214,7 @@ impl AppState {
             config,
             form: None,
             active: None,
+            session_ready: false,
         }
     }
 
@@ -319,9 +324,35 @@ impl AppState {
             bottom: height as i32,
         };
         active.resize(rect);
-        if self.config.dynamic_resolution {
-            active.update_display(width, height);
+        if self.config.dynamic_resolution && self.session_ready && width != 0 && height != 0 {
+            // WM_SIZE is emitted continuously while the user drags a border.
+            // Replacing this timer coalesces the burst into one remote update.
+            unsafe {
+                SetTimer(
+                    Some(self.hwnd),
+                    DISPLAY_RESIZE_TIMER,
+                    DISPLAY_RESIZE_DELAY_MS,
+                    None,
+                );
+            }
         }
+    }
+
+    fn update_active_display(&self) {
+        if !self.config.dynamic_resolution || !self.session_ready {
+            return;
+        }
+        let Some(active) = &self.active else {
+            return;
+        };
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(self.hwnd, &mut rect) }.is_err() {
+            return;
+        }
+        let width = (rect.right - rect.left).max(0) as u32;
+        let height = (rect.bottom - rect.top).max(0) as u32;
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        active.update_display(width, height, dpi, &self.config.document);
     }
 
     fn handle_rdp_event(&mut self, event: RdpEvent) {
@@ -336,12 +367,18 @@ impl AppState {
                 set_title(self.hwnd, &format!("{server} - 正在连接 - mstsc-rs"));
             }
             RdpEventKind::Connected => {
+                self.session_ready = true;
+                self.update_active_display();
                 set_title(self.hwnd, &format!("{server} - 已连接 - mstsc-rs"));
             }
             RdpEventKind::LoginCompleted => {
+                self.session_ready = true;
+                self.update_active_display();
                 set_title(self.hwnd, &self.config.title);
             }
             RdpEventKind::Disconnected => {
+                self.session_ready = false;
+                let _ = unsafe { KillTimer(Some(self.hwnd), DISPLAY_RESIZE_TIMER) };
                 set_title(self.hwnd, &format!("{server} - 已断开 - mstsc-rs"));
                 if !event.arguments.is_empty() && event.arguments.iter().any(|value| value != "0") {
                     show_message(
@@ -498,6 +535,18 @@ unsafe extern "system" fn window_proc(
         return LRESULT(1);
     }
 
+    // Let Windows commit the per-monitor DPI transition before reading the
+    // new DPI and forwarding it to the remote session. Do this before taking
+    // a mutable reference to AppState because DefWindowProcW can re-enter the
+    // window procedure while processing a DPI transition.
+    if message == WM_DPICHANGED {
+        let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+        if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+            state.update_active_display();
+        }
+        return result;
+    }
+
     let state = unsafe { state_from_hwnd(hwnd) };
     match message {
         WM_CREATE => {
@@ -538,6 +587,13 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == DISPLAY_RESIZE_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), DISPLAY_RESIZE_TIMER) };
+            if let Some(state) = state {
+                state.update_active_display();
+            }
+            LRESULT(0)
+        }
         WM_RDP_EVENT => {
             if let Some(state) = state {
                 let events = state
@@ -561,6 +617,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = unsafe { KillTimer(Some(hwnd), DISPLAY_RESIZE_TIMER) };
             if let Some(state) = state {
                 state.active.take();
             }
