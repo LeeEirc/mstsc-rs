@@ -51,10 +51,10 @@ pub struct Cli {
     #[arg(short = 'f', long, action = ArgAction::SetTrue)]
     pub fullscreen: bool,
 
-    #[arg(long, action = ArgAction::SetTrue)]
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "span")]
     pub multimon: bool,
 
-    #[arg(long, action = ArgAction::SetTrue)]
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "multimon")]
     pub span: bool,
 
     #[arg(long, action = ArgAction::SetTrue)]
@@ -275,5 +275,10 @@ mod tests {
         assert!(cli.multimon);
         assert_eq!(cli.width, Some(1920));
         assert_eq!(cli.height, Some(1080));
+    }
+
+    #[test]
+    fn rejects_span_with_multimon() {
+        assert!(Cli::try_parse_compatible(["mstsc-rs", "/span", "/multimon"]).is_err());
     }
 }

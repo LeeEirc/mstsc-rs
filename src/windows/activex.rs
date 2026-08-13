@@ -1,10 +1,15 @@
 use std::ffi::c_void;
 use std::mem::{ManuallyDrop, size_of};
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_Get_DevNode_PropertyW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CR_SUCCESS,
+};
+use windows::Win32::Devices::Properties::{DEVPKEY_Device_ClassGuid, DEVPROP_TYPE_GUID};
 use windows::Win32::Foundation::{
-    DISP_E_UNKNOWNNAME, E_NOINTERFACE, E_NOTIMPL, FreeLibrary, HMODULE, HWND, LPARAM, RECT, S_OK,
-    SIZE, VARIANT_BOOL, WPARAM,
+    DISP_E_UNKNOWNNAME, E_NOINTERFACE, E_NOTIMPL, E_POINTER, FreeLibrary, HMODULE, HWND, LPARAM,
+    RECT, S_OK, SIZE, VARIANT_BOOL, WPARAM,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CoCreateInstance, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
@@ -19,6 +24,7 @@ use windows::Win32::System::Ole::{
     IOleObject, IOleWindow_Impl, OLECLOSE_NOSAVE, OLEGETMONIKER, OLEINPLACEFRAMEINFO,
     OLEIVERB_INPLACEACTIVATE, OLEMENUGROUPWIDTHS, OLEWHICHMK, OleSetContainedObject,
 };
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::System::Variant::{
     VARIANT, VT_BOOL, VT_BSTR, VT_DISPATCH, VT_EMPTY, VT_I2, VT_I4, VT_INT, VT_UI2, VT_UI4,
     VT_UINT, VariantClear,
@@ -45,16 +51,68 @@ const CLSID_MS_RDP_CLIENT_9_NOT_SAFE_FOR_SCRIPTING: GUID =
     GUID::from_u128(0x8b918b82_7985_4c24_89df_c33ad2bbfbcd);
 const DIID_MS_TSC_AX_EVENTS: GUID = GUID::from_u128(0x336d5562_efa8_482e_8cb3_c5c0fc7a7db6);
 
+// The connection point does not accept a sink that only identifies itself as
+// IDispatch. Its QueryInterface must also recognize the outgoing dispinterface
+// IID, even though that interface uses the ordinary IDispatch vtable.
+windows_core::imp::define_interface!(
+    IMsTscAxEvents,
+    IMsTscAxEvents_Vtbl,
+    0x336d5562_efa8_482e_8cb3_c5c0fc7a7db6
+);
+
+impl std::ops::Deref for IMsTscAxEvents {
+    type Target = IDispatch;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::mem::transmute(self) }
+    }
+}
+
+windows_core::imp::interface_hierarchy!(IMsTscAxEvents, IUnknown, IDispatch);
+
+impl windows_core::RuntimeName for IMsTscAxEvents {}
+
+#[repr(C)]
+pub struct IMsTscAxEvents_Vtbl {
+    base__: windows::Win32::System::Com::IDispatch_Vtbl,
+}
+
+#[allow(non_camel_case_types)]
+pub trait IMsTscAxEvents_Impl: IDispatch_Impl {}
+
+impl IMsTscAxEvents_Vtbl {
+    pub const fn new<Identity: IMsTscAxEvents_Impl, const OFFSET: isize>() -> Self {
+        Self {
+            base__: windows::Win32::System::Com::IDispatch_Vtbl::new::<Identity, OFFSET>(),
+        }
+    }
+
+    pub fn matches(iid: &GUID) -> bool {
+        iid == &IMsTscAxEvents::IID || iid == &IDispatch::IID
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RdpEventKind {
     Connecting,
     Connected,
     LoginCompleted,
     Disconnected,
+    AutoReconnecting,
+    AutoReconnected,
     DialogDisplaying,
     DialogDismissed,
+    EnterFullScreen,
+    LeaveFullScreen,
+    RequestGoFullScreen,
+    RequestLeaveFullScreen,
+    RequestContainerMinimize,
+    FatalError,
+    Warning,
+    LogonError,
     NetworkStatusChanged,
     RemoteDesktopSizeChanged,
+    RemoteProgramDisplayed,
 }
 
 pub(super) struct RdpEvent {
@@ -241,7 +299,7 @@ impl IOleInPlaceFrame_Impl for ActiveXSite_Impl {
     }
 }
 
-#[windows::core::implement(IDispatch)]
+#[windows::core::implement(IMsTscAxEvents)]
 struct EventCallback {
     hwnd: HWND,
     events: Arc<Mutex<Vec<RdpEvent>>>,
@@ -290,18 +348,29 @@ impl IDispatch_Impl for EventCallback_Impl {
     }
 }
 
+impl IMsTscAxEvents_Impl for EventCallback_Impl {}
+
 fn legacy_event_kind(dispid: i32) -> Option<RdpEventKind> {
     match dispid {
         1 => Some(RdpEventKind::Connecting),
         2 => Some(RdpEventKind::Connected),
         3 => Some(RdpEventKind::LoginCompleted),
         4 => Some(RdpEventKind::Disconnected),
+        5 => Some(RdpEventKind::EnterFullScreen),
+        6 => Some(RdpEventKind::LeaveFullScreen),
+        8 => Some(RdpEventKind::RequestGoFullScreen),
+        9 => Some(RdpEventKind::RequestLeaveFullScreen),
+        10 => Some(RdpEventKind::FatalError),
+        11 => Some(RdpEventKind::Warning),
         12 => Some(RdpEventKind::RemoteDesktopSizeChanged),
+        14 => Some(RdpEventKind::RequestContainerMinimize),
+        17 | 34 => Some(RdpEventKind::AutoReconnecting),
         18 => Some(RdpEventKind::DialogDisplaying),
         19 => Some(RdpEventKind::DialogDismissed),
-        29 => Some(RdpEventKind::NetworkStatusChanged),
-        31 => Some(RdpEventKind::Connected),
-        32 => Some(RdpEventKind::Connecting),
+        21 | 29 => Some(RdpEventKind::RemoteProgramDisplayed),
+        22 => Some(RdpEventKind::LogonError),
+        32 => Some(RdpEventKind::NetworkStatusChanged),
+        33 => Some(RdpEventKind::AutoReconnected),
         _ => None,
     }
 }
@@ -341,6 +410,97 @@ windows_core::imp::define_interface!(
 );
 windows_core::imp::interface_hierarchy!(IMsTscNonScriptable, IUnknown);
 
+windows_core::imp::define_interface!(
+    IMsRdpExtendedSettings,
+    IMsRdpExtendedSettings_Vtbl,
+    0x302d8188_0052_4807_806a_362b628f9ac5
+);
+windows_core::imp::interface_hierarchy!(IMsRdpExtendedSettings, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpClientNonScriptable5,
+    IMsRdpClientNonScriptable5_Vtbl,
+    0x4f6996d5_d7b1_412c_b0ff_063718566907
+);
+windows_core::imp::interface_hierarchy!(IMsRdpClientNonScriptable5, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpClientNonScriptable,
+    IMsRdpClientNonScriptable_Vtbl,
+    0x2f079c4c_87b2_4afd_97ab_20cdb43038ae
+);
+windows_core::imp::interface_hierarchy!(IMsRdpClientNonScriptable, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpClientNonScriptable3,
+    IMsRdpClientNonScriptable3_Vtbl,
+    0xb3378d90_0728_45c7_8ed7_b6159fb92219
+);
+windows_core::imp::interface_hierarchy!(IMsRdpClientNonScriptable3, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpClientNonScriptable7,
+    IMsRdpClientNonScriptable7_Vtbl,
+    0x71b4a60a_fe21_46d8_a39b_8e32ba0c5ecc
+);
+windows_core::imp::interface_hierarchy!(IMsRdpClientNonScriptable7, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpDeviceCollection,
+    IMsRdpDeviceCollection_Vtbl,
+    0x56540617_d281_488c_8738_6a8fdf64a118
+);
+windows_core::imp::interface_hierarchy!(IMsRdpDeviceCollection, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpDevice,
+    IMsRdpDevice_Vtbl,
+    0x60c3b9c8_9e92_4f5e_a3e7_604a912093ea
+);
+windows_core::imp::interface_hierarchy!(IMsRdpDevice, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpDeviceCollection2,
+    IMsRdpDeviceCollection2_Vtbl,
+    0xe0e5d68a_f2e7_4350_adfe_ac0e08d74de0
+);
+windows_core::imp::interface_hierarchy!(IMsRdpDeviceCollection2, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpDeviceV2,
+    IMsRdpDeviceV2_Vtbl,
+    0x5fb94466_7661_42a8_98b7_01904c11668f
+);
+windows_core::imp::interface_hierarchy!(IMsRdpDeviceV2, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpDriveCollection,
+    IMsRdpDriveCollection_Vtbl,
+    0x7ff17599_da2c_4677_ad35_f60c04fe1585
+);
+windows_core::imp::interface_hierarchy!(IMsRdpDriveCollection, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpDrive,
+    IMsRdpDrive_Vtbl,
+    0xd28b5458_f694_47a8_8e61_40356a767e46
+);
+windows_core::imp::interface_hierarchy!(IMsRdpDrive, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpCameraRedirConfigCollection,
+    IMsRdpCameraRedirConfigCollection_Vtbl,
+    0xae45252b_aaab_4504_b681_649d6073a37a
+);
+windows_core::imp::interface_hierarchy!(IMsRdpCameraRedirConfigCollection, IUnknown);
+
+windows_core::imp::define_interface!(
+    IMsRdpCameraRedirConfig,
+    IMsRdpCameraRedirConfig_Vtbl,
+    0x09750604_d625_47c1_9fcd_f09f735705d7
+);
+windows_core::imp::interface_hierarchy!(IMsRdpCameraRedirConfig, IUnknown);
+
 #[repr(C)]
 pub struct IMsTscNonScriptable_Vtbl {
     base__: windows_core::IUnknown_Vtbl,
@@ -358,6 +518,438 @@ impl IMsTscNonScriptable {
             .ok()
         }
     }
+}
+
+#[repr(C)]
+pub struct IMsRdpExtendedSettings_Vtbl {
+    base__: windows_core::IUnknown_Vtbl,
+    put_property:
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut VARIANT) -> windows_core::HRESULT,
+    get_property:
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut VARIANT) -> windows_core::HRESULT,
+}
+
+impl IMsRdpExtendedSettings {
+    unsafe fn set_named_property(
+        &self,
+        name: &BSTR,
+        value: *mut VARIANT,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_property)(
+                Interface::as_raw(self),
+                std::mem::transmute_copy(name),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpClientNonScriptable5_Vtbl {
+    // The version 5 interface inherits the earlier non-scriptable interfaces.
+    // The registered type library fixes put_UseMultimon at byte offset 424 on
+    // x64 (vtable slot 53, including IUnknown's three slots).
+    inherited_slots: [usize; 53],
+    put_use_multimon: unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+}
+
+impl IMsRdpClientNonScriptable5 {
+    unsafe fn set_use_multimon(&self, enabled: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_use_multimon)(
+                Interface::as_raw(self),
+                VARIANT_BOOL(if enabled { -1 } else { 0 }),
+            )
+            .ok()
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpClientNonScriptable_Vtbl {
+    // IMsTscNonScriptable occupies slots 0 through 12. The registered type
+    // library fixes NotifyRedirectDeviceChange at x64 byte offset 104.
+    inherited_slots: [usize; 13],
+    notify_redirect_device_change:
+        unsafe extern "system" fn(*mut c_void, usize, isize) -> windows_core::HRESULT,
+}
+
+impl IMsRdpClientNonScriptable {
+    unsafe fn notify_redirect_device_change(
+        &self,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).notify_redirect_device_change)(
+                Interface::as_raw(self),
+                wparam.0,
+                lparam.0,
+            )
+            .ok()
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpClientNonScriptable3_Vtbl {
+    // The registered type library fixes these methods at x64 byte offsets
+    // 200 through 240.
+    inherited_slots: [usize; 25],
+    put_redirect_dynamic_drives:
+        unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+    get_redirect_dynamic_drives: usize,
+    put_redirect_dynamic_devices:
+        unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+    get_redirect_dynamic_devices: usize,
+    get_device_collection:
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> windows_core::HRESULT,
+    get_drive_collection:
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> windows_core::HRESULT,
+}
+
+impl IMsRdpClientNonScriptable3 {
+    unsafe fn set_redirect_dynamic_drives(&self, enabled: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_redirect_dynamic_drives)(
+                Interface::as_raw(self),
+                variant_bool(enabled),
+            )
+            .ok()
+        }
+    }
+
+    unsafe fn set_redirect_dynamic_devices(&self, enabled: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_redirect_dynamic_devices)(
+                Interface::as_raw(self),
+                variant_bool(enabled),
+            )
+            .ok()
+        }
+    }
+
+    unsafe fn device_collection(&self) -> windows::core::Result<IMsRdpDeviceCollection> {
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            (Interface::vtable(self).get_device_collection)(Interface::as_raw(self), &mut raw)
+                .ok()?;
+            interface_from_raw(raw)
+        }
+    }
+
+    unsafe fn drive_collection(&self) -> windows::core::Result<IMsRdpDriveCollection> {
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            (Interface::vtable(self).get_drive_collection)(Interface::as_raw(self), &mut raw)
+                .ok()?;
+            interface_from_raw(raw)
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpClientNonScriptable7_Vtbl {
+    // CameraRedirConfigCollection is at x64 byte offset 536 (slot 67).
+    inherited_slots: [usize; 67],
+    get_camera_redir_config_collection:
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> windows_core::HRESULT,
+}
+
+impl IMsRdpClientNonScriptable7 {
+    unsafe fn camera_collection(&self) -> windows::core::Result<IMsRdpCameraRedirConfigCollection> {
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            (Interface::vtable(self).get_camera_redir_config_collection)(
+                Interface::as_raw(self),
+                &mut raw,
+            )
+            .ok()?;
+            interface_from_raw(raw)
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpDeviceCollection_Vtbl {
+    base__: windows_core::IUnknown_Vtbl,
+    rescan_devices: unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+    get_device_by_index:
+        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> windows_core::HRESULT,
+    get_device_by_id: usize,
+    get_device_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> windows_core::HRESULT,
+}
+
+impl IMsRdpDeviceCollection {
+    unsafe fn rescan(&self, redirect_new: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).rescan_devices)(
+                Interface::as_raw(self),
+                variant_bool(redirect_new),
+            )
+            .ok()
+        }
+    }
+
+    unsafe fn count(&self) -> windows::core::Result<u32> {
+        let mut count = 0;
+        unsafe {
+            (Interface::vtable(self).get_device_count)(Interface::as_raw(self), &mut count).ok()?;
+        }
+        Ok(count)
+    }
+
+    unsafe fn by_index(&self, index: u32) -> windows::core::Result<IMsRdpDevice> {
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            (Interface::vtable(self).get_device_by_index)(Interface::as_raw(self), index, &mut raw)
+                .ok()?;
+            interface_from_raw(raw)
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpDeviceCollection2_Vtbl {
+    // IMsRdpDeviceCollection occupies slots 0 through 6 and
+    // AddDeviceByInstanceId occupies slot 7.
+    inherited_slots: [usize; 8],
+    redirect_now: unsafe extern "system" fn(*mut c_void) -> windows_core::HRESULT,
+}
+
+impl IMsRdpDeviceCollection2 {
+    unsafe fn redirect_now(&self) -> windows::core::Result<()> {
+        unsafe { (Interface::vtable(self).redirect_now)(Interface::as_raw(self)).ok() }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpDevice_Vtbl {
+    base__: windows_core::IUnknown_Vtbl,
+    get_device_instance_id:
+        unsafe extern "system" fn(*mut c_void, *mut BSTR) -> windows_core::HRESULT,
+    get_friendly_name: usize,
+    get_device_description: usize,
+    put_redirection_state:
+        unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+    get_redirection_state: usize,
+}
+
+impl IMsRdpDevice {
+    unsafe fn instance_id(&self) -> windows::core::Result<String> {
+        let mut value = BSTR::new();
+        unsafe {
+            (Interface::vtable(self).get_device_instance_id)(Interface::as_raw(self), &mut value)
+                .ok()?;
+        }
+        Ok(value.to_string())
+    }
+
+    unsafe fn set_redirected(&self, enabled: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_redirection_state)(
+                Interface::as_raw(self),
+                variant_bool(enabled),
+            )
+            .ok()
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpDeviceV2_Vtbl {
+    // IMsRdpDevice occupies slots 0 through 7 and DeviceText occupies slot 8.
+    // IsUSBDevice is therefore at x64 byte offset 72 (slot 9).
+    inherited_slots: [usize; 9],
+    get_is_usb_device:
+        unsafe extern "system" fn(*mut c_void, *mut VARIANT_BOOL) -> windows_core::HRESULT,
+}
+
+impl IMsRdpDeviceV2 {
+    unsafe fn is_usb_device(&self) -> windows::core::Result<bool> {
+        let mut value = VARIANT_BOOL(0);
+        unsafe {
+            (Interface::vtable(self).get_is_usb_device)(Interface::as_raw(self), &mut value)
+                .ok()?;
+        }
+        Ok(value.0 != 0)
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpDriveCollection_Vtbl {
+    base__: windows_core::IUnknown_Vtbl,
+    rescan_drives: unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+    get_drive_by_index:
+        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> windows_core::HRESULT,
+    get_drive_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> windows_core::HRESULT,
+}
+
+impl IMsRdpDriveCollection {
+    unsafe fn rescan(&self, redirect_new: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).rescan_drives)(
+                Interface::as_raw(self),
+                variant_bool(redirect_new),
+            )
+            .ok()
+        }
+    }
+
+    unsafe fn count(&self) -> windows::core::Result<u32> {
+        let mut count = 0;
+        unsafe {
+            (Interface::vtable(self).get_drive_count)(Interface::as_raw(self), &mut count).ok()?;
+        }
+        Ok(count)
+    }
+
+    unsafe fn by_index(&self, index: u32) -> windows::core::Result<IMsRdpDrive> {
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            (Interface::vtable(self).get_drive_by_index)(Interface::as_raw(self), index, &mut raw)
+                .ok()?;
+            interface_from_raw(raw)
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpDrive_Vtbl {
+    base__: windows_core::IUnknown_Vtbl,
+    get_name: unsafe extern "system" fn(*mut c_void, *mut BSTR) -> windows_core::HRESULT,
+    put_redirection_state:
+        unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+    get_redirection_state: usize,
+}
+
+impl IMsRdpDrive {
+    unsafe fn name(&self) -> windows::core::Result<String> {
+        let mut value = BSTR::new();
+        unsafe {
+            (Interface::vtable(self).get_name)(Interface::as_raw(self), &mut value).ok()?;
+        }
+        Ok(value.to_string())
+    }
+
+    unsafe fn set_redirected(&self, enabled: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_redirection_state)(
+                Interface::as_raw(self),
+                variant_bool(enabled),
+            )
+            .ok()
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpCameraRedirConfigCollection_Vtbl {
+    base__: windows_core::IUnknown_Vtbl,
+    rescan: unsafe extern "system" fn(*mut c_void) -> windows_core::HRESULT,
+    get_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> windows_core::HRESULT,
+    get_by_index:
+        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> windows_core::HRESULT,
+    get_by_symbolic_link: usize,
+    get_by_instance_id: usize,
+    add_config: usize,
+    put_redirect_by_default:
+        unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+    get_redirect_by_default: usize,
+    put_encode_video: unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+    get_encode_video: usize,
+    put_encoding_quality: unsafe extern "system" fn(*mut c_void, i32) -> windows_core::HRESULT,
+    get_encoding_quality: usize,
+}
+
+impl IMsRdpCameraRedirConfigCollection {
+    unsafe fn rescan(&self) -> windows::core::Result<()> {
+        unsafe { (Interface::vtable(self).rescan)(Interface::as_raw(self)).ok() }
+    }
+
+    unsafe fn count(&self) -> windows::core::Result<u32> {
+        let mut count = 0;
+        unsafe {
+            (Interface::vtable(self).get_count)(Interface::as_raw(self), &mut count).ok()?;
+        }
+        Ok(count)
+    }
+
+    unsafe fn by_index(&self, index: u32) -> windows::core::Result<IMsRdpCameraRedirConfig> {
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            (Interface::vtable(self).get_by_index)(Interface::as_raw(self), index, &mut raw)
+                .ok()?;
+            interface_from_raw(raw)
+        }
+    }
+
+    unsafe fn set_redirect_by_default(&self, enabled: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_redirect_by_default)(
+                Interface::as_raw(self),
+                variant_bool(enabled),
+            )
+            .ok()
+        }
+    }
+
+    unsafe fn set_encode_video(&self, enabled: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_encode_video)(
+                Interface::as_raw(self),
+                variant_bool(enabled),
+            )
+            .ok()
+        }
+    }
+
+    unsafe fn set_encoding_quality(&self, quality: i32) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_encoding_quality)(Interface::as_raw(self), quality).ok()
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IMsRdpCameraRedirConfig_Vtbl {
+    base__: windows_core::IUnknown_Vtbl,
+    get_friendly_name: usize,
+    get_symbolic_link: unsafe extern "system" fn(*mut c_void, *mut BSTR) -> windows_core::HRESULT,
+    get_instance_id: usize,
+    get_parent_instance_id: usize,
+    put_redirected: unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows_core::HRESULT,
+    get_redirected: usize,
+    get_device_exists: usize,
+}
+
+impl IMsRdpCameraRedirConfig {
+    unsafe fn symbolic_link(&self) -> windows::core::Result<String> {
+        let mut value = BSTR::new();
+        unsafe {
+            (Interface::vtable(self).get_symbolic_link)(Interface::as_raw(self), &mut value)
+                .ok()?;
+        }
+        Ok(value.to_string())
+    }
+
+    unsafe fn set_redirected(&self, enabled: bool) -> windows::core::Result<()> {
+        unsafe {
+            (Interface::vtable(self).put_redirected)(Interface::as_raw(self), variant_bool(enabled))
+                .ok()
+        }
+    }
+}
+
+fn variant_bool(value: bool) -> VARIANT_BOOL {
+    VARIANT_BOOL(if value { -1 } else { 0 })
+}
+
+unsafe fn interface_from_raw<T: Interface>(raw: *mut c_void) -> windows::core::Result<T> {
+    let raw = NonNull::new(raw).ok_or_else(|| WinError::from_hresult(E_POINTER))?;
+    Ok(unsafe { T::from_raw(raw.as_ptr()) })
 }
 
 #[repr(transparent)]
@@ -592,6 +1184,185 @@ fn pixels_to_millimeters(pixels: u32, dpi: u32) -> u32 {
         .clamp(10, 10_000)
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RedirectionSettings {
+    drives: Option<String>,
+    devices: Option<String>,
+    usb_devices: Option<String>,
+    cameras: Option<String>,
+    encode_video: Option<bool>,
+    encoding_quality: Option<i32>,
+}
+
+impl RedirectionSettings {
+    fn from_document(document: &RdpDocument) -> Self {
+        Self {
+            drives: document.get_string("drivestoredirect").map(str::to_owned),
+            devices: document.get_string("devicestoredirect").map(str::to_owned),
+            usb_devices: document
+                .get_string("usbdevicestoredirect")
+                .map(str::to_owned),
+            cameras: document.get_string("camerastoredirect").map(str::to_owned),
+            encode_video: document
+                .get_integer("encode redirected video capture")
+                .map(|value| value != 0),
+            encoding_quality: document
+                .get_integer("redirected video capture encoding quality")
+                .filter(|value| (0..=2).contains(value)),
+        }
+    }
+
+    fn has_device_configuration(&self) -> bool {
+        self.devices.is_some() || self.usb_devices.is_some()
+    }
+
+    fn has_camera_configuration(&self) -> bool {
+        self.cameras.is_some() || self.encode_video.is_some() || self.encoding_quality.is_some()
+    }
+
+    fn redirect_dynamic_drives(&self) -> bool {
+        self.drives
+            .as_deref()
+            .is_some_and(|value| selectors_redirect_new(value, "dynamicdrives"))
+    }
+
+    fn redirect_dynamic_devices(&self) -> bool {
+        self.devices
+            .as_deref()
+            .is_some_and(|value| selectors_redirect_new(value, "dynamicdevices"))
+            || self
+                .usb_devices
+                .as_deref()
+                .is_some_and(|value| selectors(value).any(|selector| selector == "*"))
+    }
+
+    fn drive_is_selected(&self, drive_name: &str) -> Option<bool> {
+        let configured = self.drives.as_deref()?;
+        let wanted = normalize_drive_name(drive_name);
+        Some(selectors(configured).any(|selector| {
+            selector == "*"
+                || (selector != "dynamicdrives"
+                    && normalize_drive_name(selector).eq_ignore_ascii_case(wanted))
+        }))
+    }
+
+    fn device_is_selected(
+        &self,
+        instance_id: &str,
+        is_usb: bool,
+        class_guid: Option<GUID>,
+    ) -> Option<bool> {
+        let configured = if is_usb {
+            self.usb_devices.as_deref()?
+        } else {
+            self.devices.as_deref()?
+        };
+        Some(selector_list_matches(
+            configured,
+            instance_id,
+            class_guid,
+            if is_usb {
+                "dynamicusbdevices"
+            } else {
+                "dynamicdevices"
+            },
+        ))
+    }
+
+    fn camera_is_selected(&self, symbolic_link: &str) -> Option<bool> {
+        let configured = self.cameras.as_deref()?;
+        Some(selector_list_matches(configured, symbolic_link, None, ""))
+    }
+}
+
+fn selectors(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+}
+
+fn selectors_redirect_new(value: &str, dynamic_marker: &str) -> bool {
+    selectors(value)
+        .any(|selector| selector == "*" || selector.eq_ignore_ascii_case(dynamic_marker))
+}
+
+fn normalize_drive_name(value: &str) -> &str {
+    value.trim().trim_end_matches(['\\', '/'])
+}
+
+fn selector_list_matches(
+    configured: &str,
+    instance_id: &str,
+    class_guid: Option<GUID>,
+    dynamic_marker: &str,
+) -> bool {
+    let mut selected = false;
+    for selector in selectors(configured).filter(|selector| !selector.starts_with('-')) {
+        let is_dynamic_marker =
+            !dynamic_marker.is_empty() && selector.eq_ignore_ascii_case(dynamic_marker);
+        if selector == "*"
+            || (!is_dynamic_marker && selector_matches(selector, instance_id, class_guid))
+        {
+            selected = true;
+        }
+    }
+    for selector in selectors(configured).filter_map(|selector| selector.strip_prefix('-')) {
+        if selector_matches(selector, instance_id, class_guid) {
+            selected = false;
+        }
+    }
+    selected
+}
+
+fn selector_matches(selector: &str, instance_id: &str, class_guid: Option<GUID>) -> bool {
+    if selector == "*" {
+        return true;
+    }
+    if let Some(selector_guid) = selector
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .and_then(|value| GUID::try_from(value).ok())
+    {
+        return class_guid == Some(selector_guid);
+    }
+    instance_id
+        .get(..selector.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(selector))
+}
+
+fn device_class_guid(instance_id: &str) -> Option<GUID> {
+    let wide = instance_id
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut device_instance = 0;
+    if unsafe {
+        CM_Locate_DevNodeW(
+            &mut device_instance,
+            PCWSTR(wide.as_ptr()),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    } != CR_SUCCESS
+    {
+        return None;
+    }
+    let mut class_guid = GUID::zeroed();
+    let mut property_type = Default::default();
+    let mut buffer_size = size_of::<GUID>() as u32;
+    let result = unsafe {
+        CM_Get_DevNode_PropertyW(
+            device_instance,
+            &DEVPKEY_Device_ClassGuid,
+            &mut property_type,
+            Some((&mut class_guid as *mut GUID).cast()),
+            &mut buffer_size,
+            0,
+        )
+    };
+    (result == CR_SUCCESS && property_type == DEVPROP_TYPE_GUID).then_some(class_guid)
+}
+
 pub(super) struct ActiveXHost {
     site: ComObject<ActiveXSite>,
     ole_object: IOleObject,
@@ -600,6 +1371,7 @@ pub(super) struct ActiveXHost {
     client: IDispatch,
     event_connection: Option<EventConnection>,
     events: Arc<Mutex<Vec<RdpEvent>>>,
+    redirection: RedirectionSettings,
     // Must be dropped after every COM interface sourced from mstscax.dll.
     _rdp_module: LoadedModule,
 }
@@ -607,7 +1379,7 @@ pub(super) struct ActiveXHost {
 struct EventConnection {
     point: IConnectionPoint,
     cookie: u32,
-    _callback: IDispatch,
+    _callback: IMsTscAxEvents,
 }
 
 struct LoadedModule(HMODULE);
@@ -659,6 +1431,33 @@ fn set_optional(dispatch: &IDispatch, property: &str, mut value: DispatchValue) 
 fn set_document_bool(dispatch: &IDispatch, property: &str, document: &RdpDocument, key: &str) {
     if let Some(value) = document.get_integer(key) {
         set_optional(dispatch, property, DispatchValue::boolean(value != 0));
+    }
+}
+
+fn set_extended_optional(
+    extended: &IMsRdpExtendedSettings,
+    property: &str,
+    mut value: DispatchValue,
+) {
+    let name = BSTR::from(property);
+    if let Err(error) = unsafe { extended.set_named_property(&name, &mut value.0) } {
+        tracing::debug!(%property, %error, "extended RDP setting is unavailable");
+    }
+}
+
+fn system_webauthn_plugin_path() -> Option<String> {
+    let mut buffer = vec![0u16; 512];
+    loop {
+        let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+        if length == 0 || length > 32_767 {
+            return None;
+        }
+        if length < buffer.len() {
+            let mut path = String::from_utf16(&buffer[..length]).ok()?;
+            path.push_str("\\webauthn.dll");
+            return std::path::Path::new(&path).is_file().then_some(path);
+        }
+        buffer.resize(length + 1, 0);
     }
 }
 
@@ -735,6 +1534,7 @@ impl ActiveXHost {
             client,
             event_connection: None,
             events: Arc::new(Mutex::new(Vec::new())),
+            redirection: RedirectionSettings::default(),
             _rdp_module: rdp_module,
         })
     }
@@ -753,27 +1553,21 @@ impl ActiveXHost {
         Ok(host)
     }
 
-    fn apply_settings(&self, config: &SessionConfig) -> Result<()> {
+    fn apply_settings(&mut self, config: &SessionConfig) -> Result<()> {
+        self.redirection = RedirectionSettings::from_document(&config.document);
         let server = config.server.as_deref().ok_or_else(|| {
             crate::error::Error::CommandLine("server address is required".to_owned())
-        })?;
-        let username = config
-            .username
-            .as_deref()
-            .ok_or_else(|| crate::error::Error::CommandLine("user name is required".to_owned()))?;
-        let password = config.password.as_ref().ok_or_else(|| {
-            crate::error::Error::CommandLine(
-                "the desktop ActiveX control requires a password supplied by the user".to_owned(),
-            )
         })?;
         let (server, port) = split_server_port(server);
 
         self.client
             .set_property("Server", &mut DispatchValue::string(server))
             .windows_context("setting the RDP server address")?;
-        self.client
-            .set_property("UserName", &mut DispatchValue::string(username))
-            .windows_context("setting the RDP user name")?;
+        if let Some(username) = config.username.as_deref() {
+            self.client
+                .set_property("UserName", &mut DispatchValue::string(username))
+                .windows_context("setting the RDP user name")?;
+        }
         if let Some(domain) = config.domain.as_deref() {
             self.client
                 .set_property("Domain", &mut DispatchValue::string(domain))
@@ -784,12 +1578,12 @@ impl ActiveXHost {
             .document
             .get_integer("desktopwidth")
             .unwrap_or(1280)
-            .clamp(200, 7680);
+            .clamp(200, 8192);
         let height = config
             .document
             .get_integer("desktopheight")
             .unwrap_or(800)
-            .clamp(200, 4320);
+            .clamp(200, 8192);
         let color_depth = config
             .document
             .get_integer("session bpp")
@@ -805,16 +1599,29 @@ impl ActiveXHost {
             .set_property("ColorDepth", &mut DispatchValue::integer(color_depth))
             .windows_context("setting the remote desktop color depth")?;
         self.client
-            .set_property("FullScreen", &mut DispatchValue::boolean(config.fullscreen))
+            .set_property(
+                "FullScreen",
+                &mut DispatchValue::boolean(config.fullscreen && !config.span),
+            )
             .windows_context("setting full-screen mode")?;
+        if let Some(value) = config.document.get_integer("use multimon") {
+            let multimon: IMsRdpClientNonScriptable5 = self
+                .client
+                .cast()
+                .windows_context("opening the multiple-monitor RDP interface")?;
+            unsafe { multimon.set_use_multimon(value != 0) }
+                .windows_context("setting multiple-monitor mode")?;
+        }
 
-        let non_scriptable: IMsTscNonScriptable = self
-            .client
-            .cast()
-            .windows_context("opening the secure RDP credential interface")?;
-        let password = BSTR::from(password.expose());
-        unsafe { non_scriptable.set_clear_text_password(&password) }
-            .windows_context("passing the password to the system RDP control")?;
+        if let Some(password) = config.password.as_ref() {
+            let non_scriptable: IMsTscNonScriptable = self
+                .client
+                .cast()
+                .windows_context("opening the secure RDP credential interface")?;
+            let password = BSTR::from(password.expose());
+            unsafe { non_scriptable.set_clear_text_password(&password) }
+                .windows_context("passing the password to the system RDP control")?;
+        }
 
         let advanced = self
             .client
@@ -831,12 +1638,27 @@ impl ActiveXHost {
             ])
             .windows_context("opening the desktop RDP advanced settings")?;
 
+        set_optional(
+            &advanced,
+            "ContainerHandledFullScreen",
+            DispatchValue::boolean(config.span),
+        );
+
         if let Some(port) = port {
             set_optional(
                 &advanced,
                 "RDPPort",
                 DispatchValue::integer(i32::from(port)),
             );
+        }
+        if config.document.get_integer("redirectwebauthn") == Some(1) {
+            if let Some(plugin) = system_webauthn_plugin_path() {
+                set_optional(&advanced, "PluginDlls", DispatchValue::string(&plugin));
+            } else {
+                tracing::warn!(
+                    "WebAuthn redirection was requested but the system WebAuthn RDP plug-in is unavailable"
+                );
+            }
         }
         set_document_bool(
             &advanced,
@@ -913,8 +1735,170 @@ impl ActiveXHost {
             );
         }
 
+        self.apply_extended_settings(config)?;
+        self.apply_resource_redirection(false)?;
         self.apply_gateway_settings(config);
         self.apply_remote_app_settings(config);
+        Ok(())
+    }
+
+    fn apply_extended_settings(&self, config: &SessionConfig) -> Result<()> {
+        let extended: IMsRdpExtendedSettings = self
+            .client
+            .cast()
+            .windows_context("opening the extended RDP settings")?;
+
+        for (property, key) in [
+            ("RestrictedLogon", "restricted admin mode"),
+            ("RedirectedAuthentication", "remote credential guard"),
+            ("EnableLocationRedirection", "redirectlocation"),
+            ("EnableRdsAadAuth", "enablerdsaadauth"),
+            ("RDGIsKDCProxy", "rdgiskdcproxy"),
+        ] {
+            if let Some(value) = config.document.get_integer(key) {
+                set_extended_optional(&extended, property, DispatchValue::boolean(value != 0));
+            }
+        }
+        for (property, key) in [
+            ("DesktopScaleFactor", "desktopscalefactor"),
+            ("DeviceScaleFactor", "devicescalefactor"),
+        ] {
+            if let Some(value) = config.document.get_integer(key).filter(|value| *value >= 0) {
+                set_extended_optional(&extended, property, DispatchValue::unsigned(value as u32));
+            }
+        }
+        for (property, key) in [
+            ("SelectedMonitors", "selectedmonitors"),
+            ("KDCProxyName", "kdcproxyname"),
+        ] {
+            if let Some(value) = config.document.get_string(key) {
+                set_extended_optional(&extended, property, DispatchValue::string(value));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_resource_redirection(&self, redirect_now: bool) -> Result<()> {
+        if self.redirection.drives.is_some() || self.redirection.has_device_configuration() {
+            let non_scriptable: IMsRdpClientNonScriptable3 = self
+                .client
+                .cast()
+                .windows_context("opening the device-redirection RDP interface")?;
+
+            if self.redirection.drives.is_some() {
+                unsafe {
+                    non_scriptable
+                        .set_redirect_dynamic_drives(self.redirection.redirect_dynamic_drives())
+                        .windows_context("setting dynamic drive redirection")?;
+                }
+                let drives = unsafe { non_scriptable.drive_collection() }
+                    .windows_context("opening the redirected-drive collection")?;
+                unsafe { drives.rescan(false) }
+                    .windows_context("enumerating local drives for redirection")?;
+                let count = unsafe { drives.count() }
+                    .windows_context("counting local drives for redirection")?
+                    .min(4_096);
+                for index in 0..count {
+                    let drive = unsafe { drives.by_index(index) }
+                        .windows_context("opening a local drive redirection entry")?;
+                    let name =
+                        unsafe { drive.name() }.windows_context("reading a local drive name")?;
+                    if let Some(selected) = self.redirection.drive_is_selected(&name) {
+                        unsafe { drive.set_redirected(selected) }
+                            .windows_context("selecting a local drive for redirection")?;
+                    }
+                }
+            }
+
+            if self.redirection.has_device_configuration() {
+                unsafe {
+                    non_scriptable
+                        .set_redirect_dynamic_devices(self.redirection.redirect_dynamic_devices())
+                        .windows_context("setting dynamic device redirection")?;
+                }
+                let devices = unsafe { non_scriptable.device_collection() }
+                    .windows_context("opening the redirected-device collection")?;
+                unsafe { devices.rescan(false) }
+                    .windows_context("enumerating local devices for redirection")?;
+                let count = unsafe { devices.count() }
+                    .windows_context("counting local devices for redirection")?
+                    .min(4_096);
+                for index in 0..count {
+                    let device = unsafe { devices.by_index(index) }
+                        .windows_context("opening a local device redirection entry")?;
+                    let instance_id = unsafe { device.instance_id() }
+                        .windows_context("reading a local device instance identifier")?;
+                    let is_usb = device
+                        .cast::<IMsRdpDeviceV2>()
+                        .ok()
+                        .and_then(|device| unsafe { device.is_usb_device() }.ok())
+                        .unwrap_or_else(|| {
+                            instance_id
+                                .get(..4)
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("USB\\"))
+                                || instance_id.get(..8).is_some_and(|prefix| {
+                                    prefix.eq_ignore_ascii_case("\\\\?\\usb#")
+                                })
+                        });
+                    if let Some(selected) = self.redirection.device_is_selected(
+                        &instance_id,
+                        is_usb,
+                        device_class_guid(&instance_id),
+                    ) {
+                        unsafe { device.set_redirected(selected) }
+                            .windows_context("selecting a local device for redirection")?;
+                    }
+                }
+                if redirect_now
+                    && let Ok(devices_v2) = devices.cast::<IMsRdpDeviceCollection2>()
+                    && let Err(error) = unsafe { devices_v2.redirect_now() }
+                {
+                    tracing::debug!(%error, "immediate device redirection is unavailable");
+                }
+            }
+        }
+
+        if self.redirection.has_camera_configuration() {
+            let non_scriptable: IMsRdpClientNonScriptable7 = self
+                .client
+                .cast()
+                .windows_context("opening the camera-redirection RDP interface")?;
+            let cameras = unsafe { non_scriptable.camera_collection() }
+                .windows_context("opening the camera-redirection collection")?;
+            unsafe { cameras.rescan() }
+                .windows_context("enumerating local cameras for redirection")?;
+
+            if let Some(configured) = self.redirection.cameras.as_deref() {
+                unsafe {
+                    cameras
+                        .set_redirect_by_default(
+                            selectors(configured).any(|selector| selector == "*"),
+                        )
+                        .windows_context("setting the default camera-redirection state")?;
+                }
+                let count = unsafe { cameras.count() }
+                    .windows_context("counting local cameras for redirection")?
+                    .min(4_096);
+                for index in 0..count {
+                    let camera = unsafe { cameras.by_index(index) }
+                        .windows_context("opening a local camera redirection entry")?;
+                    let symbolic_link = unsafe { camera.symbolic_link() }
+                        .windows_context("reading a local camera symbolic link")?;
+                    if let Some(selected) = self.redirection.camera_is_selected(&symbolic_link) {
+                        unsafe { camera.set_redirected(selected) }
+                            .windows_context("selecting a local camera for redirection")?;
+                    }
+                }
+            }
+            if let Some(enabled) = self.redirection.encode_video {
+                unsafe { cameras.set_encode_video(enabled) }
+                    .windows_context("setting redirected-camera video encoding")?;
+            }
+            if let Some(quality) = self.redirection.encoding_quality {
+                unsafe { cameras.set_encoding_quality(quality) }
+                    .windows_context("setting redirected-camera encoding quality")?;
+            }
+        }
         Ok(())
     }
 
@@ -982,7 +1966,7 @@ impl ActiveXHost {
         let result = (|| {
             let container: IConnectionPointContainer = self.client.cast()?;
             let point = unsafe { container.FindConnectionPoint(&DIID_MS_TSC_AX_EVENTS) }?;
-            let callback: IDispatch = ComObject::new(EventCallback {
+            let callback: IMsTscAxEvents = ComObject::new(EventCallback {
                 hwnd,
                 events: self.events.clone(),
             })
@@ -1006,9 +1990,15 @@ impl ActiveXHost {
         }
     }
 
-    pub fn update_display(&self, width: u32, height: u32, dpi: u32, document: &RdpDocument) {
+    pub fn update_display(
+        &self,
+        width: u32,
+        height: u32,
+        dpi: u32,
+        document: &RdpDocument,
+    ) -> bool {
         if width == 0 || height == 0 {
-            return;
+            return false;
         }
         let settings = SessionDisplaySettings::from_window(width, height, dpi, document);
         if let Err(error) = self
@@ -1018,6 +2008,9 @@ impl ActiveXHost {
             // SmartSizing remains enabled, so older servers and controls still
             // resize cleanly without exposing scroll bars or clipped content.
             tracing::debug!(%error, "live RDP display update is unavailable; using SmartSizing");
+            false
+        } else {
+            true
         }
     }
 
@@ -1036,6 +2029,24 @@ impl ActiveXHost {
 
     pub fn disconnect(&self) {
         let _ = self.client.invoke_no_args("Disconnect");
+    }
+
+    pub fn notify_device_change(&self, wparam: WPARAM, lparam: LPARAM, refresh: bool) {
+        match self.client.cast::<IMsRdpClientNonScriptable>() {
+            Ok(non_scriptable) => {
+                if let Err(error) =
+                    unsafe { non_scriptable.notify_redirect_device_change(wparam, lparam) }
+                {
+                    tracing::debug!(%error, "forwarding the device-change notification failed");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "device-change forwarding is unavailable");
+            }
+        }
+        if refresh && let Err(error) = self.apply_resource_redirection(true) {
+            tracing::warn!(%error, "refreshing redirected devices after a device change failed");
+        }
     }
 
     pub fn take_events(&self) -> Vec<RdpEvent> {
@@ -1069,17 +2080,25 @@ impl Drop for ActiveXHost {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use windows::Win32::Foundation::{E_FAIL, HWND, S_FALSE, S_OK};
-    use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
+    use windows::Win32::System::Com::ITypeLib;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Ole::{LoadRegTypeLib, OleInitialize, OleUninitialize};
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_OVERLAPPED, WS_VISIBLE,
+        CreateWindowExW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
+        TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WS_OVERLAPPED, WS_VISIBLE,
     };
-    use windows::core::w;
+    use windows::core::{BSTR, GUID, Interface, w};
 
     use crate::config::{ConnectionOverrides, SecretString, SessionConfig};
     use crate::rdp::RdpDocument;
 
-    use super::{ActiveXHost, DispatchExt, SessionDisplaySettings, accelerator_was_handled};
+    use super::{
+        ActiveXHost, DispatchExt, DispatchValue, IMsRdpClientNonScriptable5,
+        IMsRdpExtendedSettings, RdpEventKind, SessionDisplaySettings, accelerator_was_handled,
+    };
 
     struct OleGuard;
 
@@ -1105,6 +2124,241 @@ mod tests {
     }
 
     #[test]
+    fn system_rdp_event_dispids_match_dispatch_map() {
+        const LIBID_MS_TSC_AX: GUID = GUID::from_u128(0x8c11efa1_92c3_11d1_bc1e_00c04fa31489);
+
+        unsafe { OleInitialize(None) }.expect("OLE initialization must succeed");
+        let _ole = OleGuard;
+        let type_library = unsafe { LoadRegTypeLib(&LIBID_MS_TSC_AX, 1, 0, 0) }
+            .expect("the system RDP type library must be registered");
+        let event_type = unsafe { type_library.GetTypeInfoOfGuid(&super::DIID_MS_TSC_AX_EVENTS) }
+            .expect("the RDP event dispinterface must have type information");
+
+        for (dispid, expected_name, expected_kind) in [
+            (1, "OnConnecting", RdpEventKind::Connecting),
+            (2, "OnConnected", RdpEventKind::Connected),
+            (3, "OnLoginComplete", RdpEventKind::LoginCompleted),
+            (4, "OnDisconnected", RdpEventKind::Disconnected),
+            (
+                12,
+                "OnRemoteDesktopSizeChange",
+                RdpEventKind::RemoteDesktopSizeChanged,
+            ),
+            (17, "OnAutoReconnecting", RdpEventKind::AutoReconnecting),
+            (
+                18,
+                "OnAuthenticationWarningDisplayed",
+                RdpEventKind::DialogDisplaying,
+            ),
+            (
+                19,
+                "OnAuthenticationWarningDismissed",
+                RdpEventKind::DialogDismissed,
+            ),
+            (22, "OnLogonError", RdpEventKind::LogonError),
+            (
+                29,
+                "OnRemoteWindowDisplayed",
+                RdpEventKind::RemoteProgramDisplayed,
+            ),
+            (
+                32,
+                "OnNetworkStatusChanged",
+                RdpEventKind::NetworkStatusChanged,
+            ),
+            (33, "OnAutoReconnected", RdpEventKind::AutoReconnected),
+            (34, "OnAutoReconnecting2", RdpEventKind::AutoReconnecting),
+        ] {
+            let mut name = BSTR::new();
+            unsafe {
+                event_type.GetDocumentation(
+                    dispid,
+                    Some(&mut name),
+                    None,
+                    std::ptr::null_mut(),
+                    None,
+                )
+            }
+            .unwrap_or_else(|error| panic!("DISPID {dispid} must be documented: {error}"));
+            assert_eq!(name.to_string(), expected_name);
+            assert_eq!(super::legacy_event_kind(dispid), Some(expected_kind));
+        }
+        assert_eq!(super::legacy_event_kind(31), None);
+    }
+
+    #[test]
+    fn system_multimon_interface_layout_matches_binding() {
+        const LIBID_MS_TSC_AX: GUID = GUID::from_u128(0x8c11efa1_92c3_11d1_bc1e_00c04fa31489);
+        const IID_MS_RDP_CLIENT_NON_SCRIPTABLE_5: GUID =
+            GUID::from_u128(0x4f6996d5_d7b1_412c_b0ff_063718566907);
+
+        unsafe { OleInitialize(None) }.expect("OLE initialization must succeed");
+        let _ole = OleGuard;
+        let type_library = unsafe { LoadRegTypeLib(&LIBID_MS_TSC_AX, 1, 0, 0) }
+            .expect("the system RDP type library must be registered");
+        let type_info =
+            unsafe { type_library.GetTypeInfoOfGuid(&IID_MS_RDP_CLIENT_NON_SCRIPTABLE_5) }
+                .expect("the multiple-monitor interface must have type information");
+        let type_attributes = unsafe { type_info.GetTypeAttr() }
+            .expect("the multiple-monitor interface must expose type attributes");
+        let function_count = unsafe { (*type_attributes).cFuncs };
+        let mut use_multimon_offsets = Vec::new();
+        for index in 0..u32::from(function_count) {
+            let description = unsafe { type_info.GetFuncDesc(index) }
+                .expect("the interface function must have a description");
+            let mut name = BSTR::new();
+            unsafe {
+                type_info.GetDocumentation(
+                    (*description).memid,
+                    Some(&mut name),
+                    None,
+                    std::ptr::null_mut(),
+                    None,
+                )
+            }
+            .expect("the interface function must be documented");
+            if name == "UseMultimon" {
+                use_multimon_offsets.push(unsafe { (*description).oVft });
+            }
+            unsafe { type_info.ReleaseFuncDesc(description) };
+        }
+        unsafe { type_info.ReleaseTypeAttr(type_attributes) };
+        assert_eq!(use_multimon_offsets, [424, 432]);
+    }
+
+    fn method_offsets(type_library: &ITypeLib, iid: &GUID, method: &str) -> Vec<i16> {
+        let type_info = unsafe { type_library.GetTypeInfoOfGuid(iid) }
+            .unwrap_or_else(|error| panic!("RDP interface {iid:?} must be registered: {error}"));
+        let attributes =
+            unsafe { type_info.GetTypeAttr() }.expect("RDP interface must expose type attributes");
+        let mut offsets = Vec::new();
+        for index in 0..u32::from(unsafe { (*attributes).cFuncs }) {
+            let function = unsafe { type_info.GetFuncDesc(index) }
+                .expect("RDP interface function must have a description");
+            let mut name = BSTR::new();
+            unsafe {
+                type_info.GetDocumentation(
+                    (*function).memid,
+                    Some(&mut name),
+                    None,
+                    std::ptr::null_mut(),
+                    None,
+                )
+            }
+            .expect("RDP interface function must be documented");
+            if name == method {
+                offsets.push(unsafe { (*function).oVft });
+            }
+            unsafe { type_info.ReleaseFuncDesc(function) };
+        }
+        unsafe { type_info.ReleaseTypeAttr(attributes) };
+        offsets
+    }
+
+    #[test]
+    fn system_redirection_interface_layouts_match_bindings() {
+        const LIBID_MS_TSC_AX: GUID = GUID::from_u128(0x8c11efa1_92c3_11d1_bc1e_00c04fa31489);
+
+        unsafe { OleInitialize(None) }.expect("OLE initialization must succeed");
+        let _ole = OleGuard;
+        let type_library = unsafe { LoadRegTypeLib(&LIBID_MS_TSC_AX, 1, 0, 0) }
+            .expect("the system RDP type library must be registered");
+
+        for (iid, method, offsets) in [
+            (
+                super::IMsRdpClientNonScriptable::IID,
+                "NotifyRedirectDeviceChange",
+                vec![104],
+            ),
+            (
+                super::IMsRdpClientNonScriptable3::IID,
+                "RedirectDynamicDrives",
+                vec![200, 208],
+            ),
+            (
+                super::IMsRdpClientNonScriptable3::IID,
+                "RedirectDynamicDevices",
+                vec![216, 224],
+            ),
+            (
+                super::IMsRdpClientNonScriptable3::IID,
+                "DeviceCollection",
+                vec![232],
+            ),
+            (
+                super::IMsRdpClientNonScriptable3::IID,
+                "DriveCollection",
+                vec![240],
+            ),
+            (
+                super::IMsRdpClientNonScriptable7::IID,
+                "CameraRedirConfigCollection",
+                vec![536],
+            ),
+            (
+                super::IMsRdpDeviceCollection::IID,
+                "RescanDevices",
+                vec![24],
+            ),
+            (
+                super::IMsRdpDeviceCollection::IID,
+                "DeviceByIndex",
+                vec![32],
+            ),
+            (super::IMsRdpDeviceCollection::IID, "DeviceCount", vec![48]),
+            (super::IMsRdpDriveCollection::IID, "RescanDrives", vec![24]),
+            (super::IMsRdpDriveCollection::IID, "DriveByIndex", vec![32]),
+            (super::IMsRdpDriveCollection::IID, "DriveCount", vec![40]),
+            (
+                super::IMsRdpCameraRedirConfigCollection::IID,
+                "Rescan",
+                vec![24],
+            ),
+            (
+                super::IMsRdpCameraRedirConfigCollection::IID,
+                "Count",
+                vec![32],
+            ),
+            (
+                super::IMsRdpCameraRedirConfigCollection::IID,
+                "ByIndex",
+                vec![40],
+            ),
+            (
+                super::IMsRdpCameraRedirConfigCollection::IID,
+                "RedirectByDefault",
+                vec![72, 80],
+            ),
+            (
+                super::IMsRdpCameraRedirConfigCollection::IID,
+                "EncodeVideo",
+                vec![88, 96],
+            ),
+            (
+                super::IMsRdpCameraRedirConfigCollection::IID,
+                "EncodingQuality",
+                vec![104, 112],
+            ),
+            (
+                super::IMsRdpCameraRedirConfig::IID,
+                "SymbolicLink",
+                vec![32],
+            ),
+            (
+                super::IMsRdpCameraRedirConfig::IID,
+                "Redirected",
+                vec![56, 64],
+            ),
+        ] {
+            assert_eq!(
+                method_offsets(&type_library, &iid, method),
+                offsets,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
     fn display_settings_follow_window_size_and_dpi() {
         let settings = SessionDisplaySettings::from_window(50, 9_000, 144, &RdpDocument::default());
         assert_eq!(settings.width, 200);
@@ -1119,6 +2373,49 @@ mod tests {
         let configured = SessionDisplaySettings::from_window(1_280, 720, 96, &document);
         assert_eq!(configured.desktop_scale_factor, 175);
         assert_eq!(configured.device_scale_factor, 140);
+    }
+
+    #[test]
+    fn resource_selectors_support_wildcards_dynamic_entries_classes_and_exclusions() {
+        let class_guid = GUID::from_u128(0x12345678_1234_1234_1234_1234567890ab);
+        assert!(super::selector_list_matches(
+            "*;-USB\\VID_BLOCKED",
+            "USB\\VID_ALLOWED&PID_0001",
+            None,
+            "dynamicdevices",
+        ));
+        assert!(!super::selector_list_matches(
+            "*;-USB\\VID_BLOCKED",
+            "USB\\VID_BLOCKED&PID_0002",
+            None,
+            "dynamicdevices",
+        ));
+        assert!(super::selector_list_matches(
+            "{12345678-1234-1234-1234-1234567890ab}",
+            "ROOT\\SAMPLE",
+            Some(class_guid),
+            "dynamicdevices",
+        ));
+        assert!(!super::selector_list_matches(
+            "DynamicDevices",
+            "ROOT\\SAMPLE",
+            None,
+            "dynamicdevices",
+        ));
+        assert!(!super::selector_list_matches(
+            "*;-*",
+            "ROOT\\SAMPLE",
+            None,
+            "dynamicdevices",
+        ));
+
+        let settings = super::RedirectionSettings {
+            drives: Some("C:\\;DynamicDrives".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(settings.drive_is_selected("C:\\"), Some(true));
+        assert_eq!(settings.drive_is_selected("D:\\"), Some(false));
+        assert!(settings.redirect_dynamic_drives());
     }
 
     #[test]
@@ -1149,17 +2446,67 @@ mod tests {
             .expect("test host window must be created");
             let window = WindowGuard(hwnd);
 
-            let host = ActiveXHost::activate(window.0)
+            let mut host = ActiveXHost::activate(window.0)
                 .expect("the system Remote Desktop ActiveX control must activate");
+            host.attach_events(window.0);
+            assert!(
+                host.event_connection.is_some(),
+                "the RDP control must accept its outgoing event dispinterface"
+            );
             host.client
                 .dispatch_id("UpdateSessionDisplaySettings")
                 .expect("the version 9/10 RDP control must expose live display updates");
+            let extended: IMsRdpExtendedSettings = host
+                .client
+                .cast()
+                .expect("the version 9/10 RDP control must expose extended settings");
+            let advanced = host
+                .client
+                .get_dispatch(&["AdvancedSettings9", "AdvancedSettings8"])
+                .expect("advanced settings must be exposed");
+            let plugin = super::system_webauthn_plugin_path()
+                .expect("the serviced Windows WebAuthn RDP plug-in must exist");
+            advanced
+                .set_property("PluginDlls", &mut DispatchValue::string(&plugin))
+                .expect("the RDP control must accept the system WebAuthn plug-in");
+            let name = BSTR::from("SelectedMonitors");
+            let mut selected_monitors = DispatchValue::string("0");
+            unsafe { extended.set_named_property(&name, &mut selected_monitors.0) }
+                .expect("the RDP control must accept selected monitor configuration");
+            let multimon: IMsRdpClientNonScriptable5 = host
+                .client
+                .cast()
+                .expect("the RDP control must expose multiple-monitor configuration");
+            unsafe { multimon.set_use_multimon(true) }
+                .expect("the RDP control must accept multiple-monitor mode");
+            let prompted_config = SessionConfig::resolve(
+                None,
+                ConnectionOverrides {
+                    server: Some("localhost:3389".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .expect("prompted RDP settings must resolve");
+            host.apply_settings(&prompted_config)
+                .expect("the RDP control must allow the system credential prompt");
             let config = SessionConfig::resolve(
                 None,
                 ConnectionOverrides {
                     server: Some("localhost:3389".to_owned()),
                     username: Some("mstsc-rs-ci".to_owned()),
                     password: Some(SecretString::new("not-a-real-password")),
+                    multimon: Some(true),
+                    restricted_admin: Some(true),
+                    redirect_location: Some(true),
+                    custom_properties: vec![
+                        "selectedmonitors:s:0".to_owned(),
+                        "drivestoredirect:s:".to_owned(),
+                        "devicestoredirect:s:".to_owned(),
+                        "usbdevicestoredirect:s:".to_owned(),
+                        "camerastoredirect:s:".to_owned(),
+                        "encode redirected video capture:i:1".to_owned(),
+                        "redirected video capture encoding quality:i:1".to_owned(),
+                    ],
                     ..Default::default()
                 },
             )
@@ -1171,5 +2518,160 @@ mod tests {
         })
         .join()
         .expect("COM activation test thread must not panic");
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly configured live RDP test host"]
+    fn live_rdp_session_reaches_login_complete() {
+        std::thread::spawn(|| {
+            unsafe { OleInitialize(None) }.expect("OLE initialization must succeed");
+            let _ole = OleGuard;
+
+            let server = std::env::var("MSTSC_RS_TEST_SERVER")
+                .expect("MSTSC_RS_TEST_SERVER must name the live test host");
+            let username = std::env::var("MSTSC_RS_TEST_USERNAME")
+                .expect("MSTSC_RS_TEST_USERNAME must name the live test account");
+            let domain = std::env::var("MSTSC_RS_TEST_DOMAIN").ok();
+            let password = std::env::var("MSTSC_RS_TEST_PASSWORD")
+                .expect("MSTSC_RS_TEST_PASSWORD must contain the live test password");
+            let timeout = std::env::var("MSTSC_RS_TEST_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(45));
+            let fullscreen = std::env::var("MSTSC_RS_TEST_FULLSCREEN")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+            let redirect_webauthn = std::env::var("MSTSC_RS_TEST_WEBAUTHN").map_or(true, |value| {
+                value != "0" && !value.eq_ignore_ascii_case("false")
+            });
+            let redirect_test_devices = std::env::var("MSTSC_RS_TEST_REDIRECTION")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+            let mut custom_properties = vec!["authentication level:i:0".to_owned()];
+            if redirect_test_devices {
+                custom_properties.extend([
+                    "drivestoredirect:s:*".to_owned(),
+                    "devicestoredirect:s:*".to_owned(),
+                    "usbdevicestoredirect:s:*".to_owned(),
+                    "camerastoredirect:s:*".to_owned(),
+                    "encode redirected video capture:i:1".to_owned(),
+                    "redirected video capture encoding quality:i:1".to_owned(),
+                ]);
+            }
+
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("mstsc-rs live connection test"),
+                    WINDOW_STYLE(WS_OVERLAPPED.0 | WS_VISIBLE.0),
+                    0,
+                    0,
+                    1024,
+                    768,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("live test host window must be created");
+            let window = WindowGuard(hwnd);
+            let config = SessionConfig::resolve(
+                None,
+                ConnectionOverrides {
+                    server: Some(server),
+                    username: Some(username),
+                    domain,
+                    password: Some(SecretString::new(password)),
+                    fullscreen: fullscreen.then_some(true),
+                    redirect_clipboard: Some(false),
+                    redirect_printers: Some(false),
+                    redirect_smartcards: Some(false),
+                    redirect_microphone: Some(false),
+                    redirect_webauthn: Some(redirect_webauthn),
+                    custom_properties,
+                    ..Default::default()
+                },
+            )
+            .expect("live RDP settings must resolve");
+            let host = ActiveXHost::create(window.0, &config)
+                .expect("the system RDP control must start the live connection");
+
+            let started = Instant::now();
+            let mut login_complete = false;
+            while started.elapsed() < timeout && !login_complete {
+                let mut message = MSG::default();
+                while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                for event in host.take_events() {
+                    eprintln!("live RDP event: {:?} {:?}", event.kind, event.arguments);
+                    match event.kind {
+                        RdpEventKind::LoginCompleted => login_complete = true,
+                        RdpEventKind::Disconnected => {
+                            panic!("live RDP session disconnected: {:?}", event.arguments)
+                        }
+                        _ => {}
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            assert!(
+                login_complete,
+                "live RDP session did not reach OnLoginComplete within {timeout:?}"
+            );
+            assert_eq!(
+                unsafe { GetModuleHandleW(w!("webauthn.dll")) }.is_ok(),
+                redirect_webauthn,
+                "the system WebAuthn DVC plug-in load state must follow redirectwebauthn"
+            );
+            if !fullscreen {
+                host.update_display(1000, 700, 96, &config.document);
+                let resize_started = Instant::now();
+                let mut next_resize_attempt = resize_started + Duration::from_secs(1);
+                let mut resized = false;
+                while resize_started.elapsed() < Duration::from_secs(10) && !resized {
+                    if Instant::now() >= next_resize_attempt {
+                        host.update_display(1000, 700, 96, &config.document);
+                        next_resize_attempt += Duration::from_secs(1);
+                    }
+                    let mut message = MSG::default();
+                    while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                        unsafe {
+                            let _ = TranslateMessage(&message);
+                            DispatchMessageW(&message);
+                        }
+                    }
+                    for event in host.take_events() {
+                        eprintln!(
+                            "live RDP resize event: {:?} {:?}",
+                            event.kind, event.arguments
+                        );
+                        if event.kind == RdpEventKind::RemoteDesktopSizeChanged
+                            && event.arguments.first().is_some_and(|value| value == "1000")
+                            && event.arguments.get(1).is_some_and(|value| value == "700")
+                        {
+                            resized = true;
+                        } else if event.kind == RdpEventKind::Disconnected {
+                            panic!("live RDP session disconnected: {:?}", event.arguments);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    resized,
+                    "live RDP session did not resize to 1000x700 within 10 seconds"
+                );
+            }
+            host.disconnect();
+            drop(host);
+            drop(window);
+        })
+        .join()
+        .expect("live RDP test thread must not panic");
     }
 }

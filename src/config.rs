@@ -78,6 +78,7 @@ pub struct SessionConfig {
     pub has_embedded_password: bool,
     pub dynamic_resolution: bool,
     pub fullscreen: bool,
+    pub span: bool,
     pub title: String,
 }
 
@@ -107,7 +108,8 @@ impl SessionConfig {
         // Windows' RDP clients default to following the local window size when
         // the property is absent. Preserve an explicit opt-out from an .rdp
         // file, but make ordinary sessions responsive by default.
-        let dynamic_resolution = document.get_integer("dynamic resolution") != Some(0);
+        let span = document.get_integer("span monitors") == Some(1);
+        let dynamic_resolution = document.get_integer("dynamic resolution") != Some(0) && !span;
         let fullscreen = document.get_integer("screen mode id") == Some(2);
         let title = overrides.title.unwrap_or_else(|| match server.as_deref() {
             Some(server) => format!("{server} - mstsc-rs"),
@@ -125,33 +127,38 @@ impl SessionConfig {
             has_embedded_password,
             dynamic_resolution,
             fullscreen,
+            span,
             title,
         })
     }
 
     pub fn needs_interactive_input(&self) -> bool {
         self.server.is_none()
-            || self.username.is_none()
-            || (self.password.is_none() && !self.has_embedded_password)
     }
 
     pub fn apply_interactive(
         &mut self,
         server: String,
-        username: String,
+        username: Option<String>,
         domain: Option<String>,
-        password: SecretString,
+        password: Option<SecretString>,
     ) {
         self.document.set_string("full address", &server);
-        self.document.set_string("username", &username);
-        if let Some(domain) = domain.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(username) = username.as_deref() {
+            self.document.set_string("username", username);
+        } else {
+            self.document.remove_all("username");
+        }
+        if let Some(domain) = domain.as_deref() {
             self.document.set_string("domain", domain);
+        } else {
+            self.document.remove_all("domain");
         }
         self.server = Some(server);
-        self.username = Some(username);
+        self.username = username;
         self.domain = domain;
-        self.password = Some(password);
-        self.password_source = Some(PasswordSource::Interactive);
+        self.password = password;
+        self.password_source = self.password.as_ref().map(|_| PasswordSource::Interactive);
     }
 
     /// Produces the setting stream without adding a clear-text password.
@@ -174,6 +181,7 @@ fn default_document() -> RdpDocument {
     document.set_integer("redirectclipboard", 1);
     document.set_integer("redirectprinters", 1);
     document.set_integer("redirectsmartcards", 1);
+    document.set_integer("redirectwebauthn", 1);
     document.set_integer("audiomode", 0);
     document.set_integer("audiocapturemode", 1);
     document
@@ -188,6 +196,12 @@ fn apply_overrides(document: &mut RdpDocument, overrides: &ConnectionOverrides) 
     set_bool_as(document, "screen mode id", overrides.fullscreen, 2, 1);
     set_bool(document, "use multimon", overrides.multimon);
     set_bool(document, "span monitors", overrides.span);
+    if overrides.span == Some(true) {
+        // Legacy span is one large remote desktop across the local virtual
+        // desktop, not RDP multiple-monitor mode.
+        document.set_integer("screen mode id", 2);
+        document.set_integer("use multimon", 0);
+    }
     set_bool(document, "administrative session", overrides.admin);
     set_bool(document, "public mode", overrides.public_mode);
     set_bool(
@@ -294,13 +308,16 @@ mod tests {
     }
 
     #[test]
-    fn detects_missing_interactive_fields() {
+    fn only_a_missing_server_requires_the_connection_form() {
         let overrides = ConnectionOverrides {
             server: Some("server".into()),
             ..Default::default()
         };
         let config = SessionConfig::resolve(None, overrides).unwrap();
-        assert!(config.needs_interactive_input());
+        assert!(!config.needs_interactive_input());
+
+        let missing_server = SessionConfig::resolve(None, ConnectionOverrides::default()).unwrap();
+        assert!(missing_server.needs_interactive_input());
     }
 
     #[test]
@@ -319,5 +336,29 @@ mod tests {
         .unwrap();
         assert!(!disabled.dynamic_resolution);
         assert_eq!(disabled.document.get_integer("dynamic resolution"), Some(0));
+    }
+
+    #[test]
+    fn webauthn_redirection_matches_the_mstsc_default() {
+        let config = SessionConfig::resolve(None, ConnectionOverrides::default()).unwrap();
+        assert_eq!(config.document.get_integer("redirectwebauthn"), Some(1));
+    }
+
+    #[test]
+    fn span_is_a_fixed_single_desktop_and_not_multimon() {
+        let config = SessionConfig::resolve(
+            None,
+            ConnectionOverrides {
+                span: Some(true),
+                multimon: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(config.span);
+        assert!(config.fullscreen);
+        assert!(!config.dynamic_resolution);
+        assert_eq!(config.document.get_integer("span monitors"), Some(1));
+        assert_eq!(config.document.get_integer("use multimon"), Some(0));
     }
 }

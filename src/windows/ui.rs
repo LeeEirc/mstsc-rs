@@ -1,25 +1,33 @@
 use std::ffi::c_void;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush, UpdateWindow};
+use windows::Win32::Graphics::Gdi::{
+    COLOR_WINDOW, EnumDisplayMonitors, GetMonitorInfoW, GetSysColorBrush, HDC, HMONITOR,
+    MONITORINFO, UpdateWindow,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, SetFocus, VK_CANCEL, VK_CONTROL, VK_MENU,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-    DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_PASSWORD, GWLP_USERDATA,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU,
-    IDC_ARROW, KillTimer, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MessageBoxW,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SetTimer,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE, WM_NCDESTROY,
-    WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    DBT_CONFIGCHANGED, DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE, DBT_DEVNODES_CHANGED,
+    DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_PASSWORD, GWL_STYLE,
+    GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
+    GetWindowTextW, HMENU, IDC_ARROW, KillTimer, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_OK, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE,
+    SW_MINIMIZE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DEVICECHANGE,
+    WM_DPICHANGED, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW,
+    WS_EX_CLIENTEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU,
     WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE,
 };
-use windows::core::{Error as WinError, HSTRING, PCWSTR, w};
+use windows::core::{BOOL, Error as WinError, HSTRING, PCWSTR, w};
 
 use crate::config::{SecretString, SessionConfig};
 use crate::error::{Error, Result, WindowsContext};
@@ -36,11 +44,145 @@ const ID_PASSWORD: isize = 1004;
 const ID_CONNECT: usize = 1005;
 const DISPLAY_RESIZE_TIMER: usize = 1;
 const DISPLAY_RESIZE_DELAY_MS: u32 = 150;
+const DISPLAY_RETRY_DELAY_MS: u32 = 750;
+const MAX_DISPLAY_UPDATE_ATTEMPTS: u8 = 8;
 
 const LABEL_WIDTH: i32 = 100;
 const EDIT_WIDTH: i32 = 390;
 const ROW_HEIGHT: i32 = 26;
 const ROW_GAP: i32 = 14;
+const MAX_SPAN_MONITORS: usize = 64;
+
+#[derive(Clone, Copy, Debug)]
+struct SpanGeometry {
+    rect: RECT,
+}
+
+impl SpanGeometry {
+    fn width(self) -> i32 {
+        self.rect.right - self.rect.left
+    }
+
+    fn height(self) -> i32 {
+        self.rect.bottom - self.rect.top
+    }
+}
+
+struct MonitorList {
+    rects: Vec<RECT>,
+    overflow: bool,
+}
+
+unsafe extern "system" fn collect_monitor(
+    monitor: HMONITOR,
+    _device_context: HDC,
+    _clip: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    let monitors = unsafe { &mut *(data.0 as *mut MonitorList) };
+    if monitors.rects.len() >= MAX_SPAN_MONITORS {
+        monitors.overflow = true;
+        return BOOL(0);
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        monitors.rects.push(info.rcMonitor);
+    }
+    BOOL(1)
+}
+
+fn validate_span_geometry(mut rects: Vec<RECT>) -> std::result::Result<SpanGeometry, &'static str> {
+    if rects.is_empty() {
+        return Err("未检测到本地显示器");
+    }
+    if rects.len() > MAX_SPAN_MONITORS {
+        return Err("本地显示器数量超出支持范围");
+    }
+    rects.sort_unstable_by_key(|rect| rect.left);
+    let first = rects[0];
+    let monitor_width = first.right - first.left;
+    let monitor_height = first.bottom - first.top;
+    if monitor_width <= 0 || monitor_height <= 0 {
+        return Err("本地显示器尺寸无效");
+    }
+    for (index, rect) in rects.iter().enumerate() {
+        if rect.right - rect.left != monitor_width
+            || rect.bottom - rect.top != monitor_height
+            || rect.top != first.top
+            || rect.bottom != first.bottom
+        {
+            return Err("/span 要求所有显示器分辨率相同且水平对齐");
+        }
+        if index > 0 && rect.left != rects[index - 1].right {
+            return Err("/span 要求显示器无间隙地水平排列");
+        }
+    }
+    let rect = RECT {
+        left: first.left,
+        top: first.top,
+        right: rects.last().expect("non-empty monitor list").right,
+        bottom: first.bottom,
+    };
+    let geometry = SpanGeometry { rect };
+    if geometry.width() > 8192 || geometry.height() > 8192 {
+        return Err("/span 的虚拟桌面尺寸超过 RDP 控件的 8192 像素上限");
+    }
+    Ok(geometry)
+}
+
+fn query_span_geometry() -> Result<SpanGeometry> {
+    let mut monitors = MonitorList {
+        rects: Vec::with_capacity(4),
+        overflow: false,
+    };
+    let completed = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM((&mut monitors as *mut MonitorList) as isize),
+        )
+    };
+    if !completed.as_bool() && !monitors.overflow {
+        return Err(Error::Windows {
+            context: "enumerating local monitors for span mode",
+            source: WinError::from_thread(),
+        });
+    }
+    if monitors.overflow {
+        return Err(Error::CommandLine(
+            "本地显示器数量超出 /span 的支持范围".to_owned(),
+        ));
+    }
+    validate_span_geometry(monitors.rects).map_err(|message| Error::CommandLine(message.to_owned()))
+}
+
+fn standard_window_style() -> WINDOW_STYLE {
+    WINDOW_STYLE(
+        WS_OVERLAPPED.0
+            | WS_CAPTION.0
+            | WS_SYSMENU.0
+            | WS_THICKFRAME.0
+            | WS_MINIMIZEBOX.0
+            | WS_MAXIMIZEBOX.0
+            | WS_CLIPCHILDREN.0
+            | WS_CLIPSIBLINGS.0,
+    )
+}
+
+fn span_window_style() -> WINDOW_STYLE {
+    WINDOW_STYLE(WS_POPUP.0 | WS_CLIPCHILDREN.0 | WS_CLIPSIBLINGS.0)
+}
+
+fn is_span_toggle_message(message: &MSG) -> bool {
+    matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+        && message.wParam.0 == usize::from(VK_CANCEL.0)
+        && unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0
+        && unsafe { GetKeyState(i32::from(VK_MENU.0)) } < 0
+}
 
 struct OleGuard;
 
@@ -197,9 +339,13 @@ impl Drop for ConfigForm {
 struct AppState {
     hwnd: HWND,
     config: SessionConfig,
+    span_geometry: Option<SpanGeometry>,
+    span_active: bool,
+    windowed_rect: RECT,
     form: Option<ConfigForm>,
     active: Option<ActiveXHost>,
     session_ready: bool,
+    display_update_attempts: u8,
 }
 
 struct CreationContext {
@@ -208,13 +354,21 @@ struct CreationContext {
 }
 
 impl AppState {
-    fn new(config: SessionConfig) -> Self {
+    fn new(
+        config: SessionConfig,
+        span_geometry: Option<SpanGeometry>,
+        windowed_rect: RECT,
+    ) -> Self {
         Self {
             hwnd: HWND::default(),
             config,
+            span_geometry,
+            span_active: span_geometry.is_some(),
+            windowed_rect,
             form: None,
             active: None,
             session_ready: false,
+            display_update_attempts: 0,
         }
     }
 
@@ -279,11 +433,11 @@ impl AppState {
         let domain = read_text(form.domain);
         let entered_password = read_text(form.password);
 
-        if server.trim().is_empty() || username.trim().is_empty() {
+        if server.trim().is_empty() {
             show_message(
                 Some(self.hwnd),
                 "连接信息不完整",
-                "请填写服务器地址和用户名。",
+                "请填写服务器地址。",
                 false,
             );
             return;
@@ -293,26 +447,16 @@ impl AppState {
         } else {
             Some(SecretString::new(entered_password))
         };
-        let Some(password) = password else {
-            show_message(
-                Some(self.hwnd),
-                "连接信息不完整",
-                "请填写密码，或通过 --password / --password-env 提供。",
-                false,
-            );
-            return;
-        };
-
         self.config.apply_interactive(
             server.trim().to_owned(),
-            username.trim().to_owned(),
+            (!username.trim().is_empty()).then(|| username.trim().to_owned()),
             (!domain.trim().is_empty()).then(|| domain.trim().to_owned()),
             password,
         );
         self.begin_session();
     }
 
-    fn resize_active(&self, width: u32, height: u32) {
+    fn resize_active(&mut self, width: u32, height: u32) {
         let Some(active) = &self.active else {
             self.layout_form();
             return;
@@ -325,6 +469,7 @@ impl AppState {
         };
         active.resize(rect);
         if self.config.dynamic_resolution && self.session_ready && width != 0 && height != 0 {
+            self.display_update_attempts = 0;
             // WM_SIZE is emitted continuously while the user drags a border.
             // Replacing this timer coalesces the burst into one remote update.
             unsafe {
@@ -338,7 +483,7 @@ impl AppState {
         }
     }
 
-    fn update_active_display(&self) {
+    fn update_active_display(&mut self) {
         if !self.config.dynamic_resolution || !self.session_ready {
             return;
         }
@@ -351,8 +496,64 @@ impl AppState {
         }
         let width = (rect.right - rect.left).max(0) as u32;
         let height = (rect.bottom - rect.top).max(0) as u32;
+        if width == 0 || height == 0 {
+            return;
+        }
+        if self.display_update_attempts >= MAX_DISPLAY_UPDATE_ATTEMPTS {
+            tracing::warn!(
+                width,
+                height,
+                "live display update remained unavailable; retaining SmartSizing"
+            );
+            self.display_update_attempts = 0;
+            return;
+        }
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-        active.update_display(width, height, dpi, &self.config.document);
+        if active.update_display(width, height, dpi, &self.config.document) {
+            self.display_update_attempts = 0;
+        } else {
+            self.display_update_attempts += 1;
+            unsafe {
+                SetTimer(
+                    Some(self.hwnd),
+                    DISPLAY_RESIZE_TIMER,
+                    DISPLAY_RETRY_DELAY_MS,
+                    None,
+                );
+            }
+        }
+    }
+
+    fn set_span_active(&mut self, enabled: bool) {
+        let Some(span) = self.span_geometry else {
+            return;
+        };
+        self.span_active = enabled;
+        let (style, rect) = if enabled {
+            (span_window_style(), span.rect)
+        } else {
+            (standard_window_style(), self.windowed_rect)
+        };
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWL_STYLE, style.0 as isize);
+        }
+        if let Err(error) = unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW,
+            )
+        } {
+            tracing::warn!(%error, "switching the span container layout failed");
+        }
+    }
+
+    fn toggle_span(&mut self) {
+        self.set_span_active(!self.span_active);
     }
 
     fn handle_rdp_event(&mut self, event: RdpEvent) {
@@ -367,8 +568,6 @@ impl AppState {
                 set_title(self.hwnd, &format!("{server} - 正在连接 - mstsc-rs"));
             }
             RdpEventKind::Connected => {
-                self.session_ready = true;
-                self.update_active_display();
                 set_title(self.hwnd, &format!("{server} - 已连接 - mstsc-rs"));
             }
             RdpEventKind::LoginCompleted => {
@@ -378,6 +577,7 @@ impl AppState {
             }
             RdpEventKind::Disconnected => {
                 self.session_ready = false;
+                self.display_update_attempts = 0;
                 let _ = unsafe { KillTimer(Some(self.hwnd), DISPLAY_RESIZE_TIMER) };
                 set_title(self.hwnd, &format!("{server} - 已断开 - mstsc-rs"));
                 if !event.arguments.is_empty() && event.arguments.iter().any(|value| value != "0") {
@@ -389,19 +589,49 @@ impl AppState {
                     );
                 }
             }
+            RdpEventKind::AutoReconnecting => {
+                self.session_ready = false;
+                self.display_update_attempts = 0;
+                let _ = unsafe { KillTimer(Some(self.hwnd), DISPLAY_RESIZE_TIMER) };
+                set_title(self.hwnd, &format!("{server} - 正在重连 - mstsc-rs"));
+            }
+            RdpEventKind::AutoReconnected => {
+                self.session_ready = true;
+                self.update_active_display();
+                set_title(self.hwnd, &self.config.title);
+            }
             RdpEventKind::DialogDisplaying => {
                 tracing::info!(
                     "the system RDP control is displaying a security or credential dialog"
                 );
             }
+            RdpEventKind::RequestContainerMinimize => unsafe {
+                let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+            },
+            RdpEventKind::FatalError | RdpEventKind::LogonError => {
+                let details = if event.arguments.is_empty() {
+                    "系统远程桌面控件未提供更多信息。".to_owned()
+                } else {
+                    event.arguments.join("\n")
+                };
+                show_message(Some(self.hwnd), "远程桌面连接错误", &details, true);
+            }
+            RdpEventKind::Warning => {
+                tracing::warn!(arguments = ?event.arguments, "RDP control warning");
+            }
+            RdpEventKind::RequestGoFullScreen => self.set_span_active(true),
+            RdpEventKind::RequestLeaveFullScreen => self.set_span_active(false),
             RdpEventKind::DialogDismissed
+            | RdpEventKind::EnterFullScreen
+            | RdpEventKind::LeaveFullScreen
             | RdpEventKind::NetworkStatusChanged
-            | RdpEventKind::RemoteDesktopSizeChanged => {}
+            | RdpEventKind::RemoteDesktopSizeChanged
+            | RdpEventKind::RemoteProgramDisplayed => {}
         }
     }
 }
 
-pub(super) fn run(config: SessionConfig) -> Result<()> {
+pub(super) fn run(mut config: SessionConfig) -> Result<()> {
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     unsafe { OleInitialize(None) }.windows_context("initializing OLE")?;
     let _ole = OleGuard;
@@ -427,41 +657,59 @@ pub(super) fn run(config: SessionConfig) -> Result<()> {
         });
     }
 
-    let width = config
+    let windowed_width = config
         .document
         .get_integer("desktopwidth")
         .unwrap_or(1280)
-        .clamp(640, 7680);
-    let height = config
+        .clamp(640, 8192);
+    let windowed_height = config
         .document
         .get_integer("desktopheight")
         .unwrap_or(800)
-        .clamp(480, 4320);
+        .clamp(480, 8192);
+    let span_geometry = config.span.then(query_span_geometry).transpose()?;
+    if let Some(span) = span_geometry {
+        config.document.set_integer("desktopwidth", span.width());
+        config.document.set_integer("desktopheight", span.height());
+    }
+    let (x, y, width, height, style) = if let Some(span) = span_geometry {
+        (
+            span.rect.left,
+            span.rect.top,
+            span.width(),
+            span.height(),
+            span_window_style(),
+        )
+    } else {
+        (
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            windowed_width,
+            windowed_height,
+            standard_window_style(),
+        )
+    };
+    let windowed_rect = RECT {
+        left: 80,
+        top: 80,
+        right: 80 + windowed_width,
+        bottom: 80 + windowed_height,
+    };
     let title = HSTRING::from(&config.title);
-    let state = Box::new(AppState::new(config));
+    let state = Box::new(AppState::new(config, span_geometry, windowed_rect));
     let state_ptr = Box::into_raw(state);
     let mut creation = CreationContext {
         state: state_ptr,
         adopted: false,
     };
-    let style = WINDOW_STYLE(
-        WS_OVERLAPPED.0
-            | WS_CAPTION.0
-            | WS_SYSMENU.0
-            | WS_THICKFRAME.0
-            | WS_MINIMIZEBOX.0
-            | WS_MAXIMIZEBOX.0
-            | WS_CLIPCHILDREN.0
-            | WS_CLIPSIBLINGS.0,
-    );
     let hwnd = match unsafe {
         CreateWindowExW(
             WS_EX_APPWINDOW,
             class_name,
             &title,
             style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            x,
+            y,
             width,
             height,
             None,
@@ -503,9 +751,23 @@ pub(super) fn run(config: SessionConfig) -> Result<()> {
         }
 
         let handled = unsafe {
-            state_from_hwnd(hwnd)
-                .and_then(|state| state.active.as_ref())
-                .is_some_and(|active| active.translate_accelerator(&message))
+            match state_from_hwnd(hwnd) {
+                Some(state)
+                    if state.span_geometry.is_some() && is_span_toggle_message(&message) =>
+                {
+                    // Bit 30 is set for key-repeat messages. Consume them
+                    // without repeatedly changing window mode.
+                    if message.lParam.0 & (1isize << 30) == 0 {
+                        state.toggle_span();
+                    }
+                    true
+                }
+                Some(state) => state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.translate_accelerator(&message)),
+                None => false,
+            }
         };
         if !handled {
             unsafe {
@@ -586,6 +848,22 @@ unsafe extern "system" fn window_proc(
                 state.resize_active(width, height);
             }
             LRESULT(0)
+        }
+        WM_DEVICECHANGE => {
+            if let Some(state) = state
+                && let Some(active) = &state.active
+            {
+                let event = wparam.0 as u32;
+                let refresh = matches!(
+                    event,
+                    DBT_DEVICEARRIVAL
+                        | DBT_DEVICEREMOVECOMPLETE
+                        | DBT_DEVNODES_CHANGED
+                        | DBT_CONFIGCHANGED
+                );
+                active.notify_device_change(wparam, lparam, refresh);
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_TIMER if wparam.0 == DISPLAY_RESIZE_TIMER => {
             let _ = unsafe { KillTimer(Some(hwnd), DISPLAY_RESIZE_TIMER) };
@@ -700,6 +978,71 @@ fn show_message(hwnd: Option<HWND>, title: &str, message: &str, error: bool) {
                 } else {
                     MB_ICONINFORMATION
                 },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::Foundation::RECT;
+
+    use super::validate_span_geometry;
+
+    #[test]
+    fn span_geometry_accepts_only_equal_contiguous_horizontal_monitors() {
+        let span = validate_span_geometry(vec![
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            RECT {
+                left: -1920,
+                top: 0,
+                right: 0,
+                bottom: 1080,
+            },
+        ])
+        .unwrap();
+        assert_eq!(span.rect.left, -1920);
+        assert_eq!(span.rect.top, 0);
+        assert_eq!(span.rect.right, 1920);
+        assert_eq!(span.rect.bottom, 1080);
+
+        assert!(
+            validate_span_geometry(vec![
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+                RECT {
+                    left: 0,
+                    top: 1080,
+                    right: 1920,
+                    bottom: 2160,
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_span_geometry(vec![
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+                RECT {
+                    left: 1920,
+                    top: 0,
+                    right: 4480,
+                    bottom: 1440,
+                },
+            ])
+            .is_err()
         );
     }
 }

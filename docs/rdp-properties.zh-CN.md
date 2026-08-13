@@ -23,9 +23,16 @@
 | 窗口/全屏 | `screen mode id` |
 | 尺寸 | `desktopwidth`、`desktopheight` |
 | 自适应窗口 | `dynamic resolution` + `UpdateSessionDisplaySettings`，不支持时回退 `SmartSizing` |
+| 多显示器 | `use multimon` + `IMsRdpClientNonScriptable5::UseMultimon` |
+| 指定显示器 | `selectedmonitors` + `IMsRdpExtendedSettings::SelectedMonitors` |
+| 传统跨屏 | `span monitors` + 宿主虚拟桌面容器 |
 | 剪贴板 | `redirectclipboard` |
 | 打印机 | `redirectprinters` |
 | 磁盘 | `drivestoredirect` |
+| 动态 PnP 设备 | `devicestoredirect` + `IMsRdpDeviceCollection` |
+| USB 设备 | `usbdevicestoredirect` + `IMsRdpDeviceV2` |
+| 摄像头 | `camerastoredirect` + `IMsRdpCameraRedirConfigCollection` |
+| WebAuthn | `redirectwebauthn` + 系统 `webauthn.dll` DVC 插件 |
 | 智能卡 | `redirectsmartcards` |
 | COM 端口 | `redirectcomports` |
 | 麦克风 | `audiocapturemode` |
@@ -33,6 +40,8 @@
 | RD Gateway | `gatewayhostname`、`gatewayusagemethod` 等 |
 | NLA/CredSSP | `enablecredsspsupport`、`authentication level` |
 | 管理会话 | `administrative session` |
+| 受限管理/Remote Credential Guard | `RestrictedLogon`、`RedirectedAuthentication` 扩展设置 |
+| 位置 | `redirectlocation` + `EnableLocationRedirection` 扩展设置 |
 | RemoteApp | `remoteapplicationmode`、`remoteapplicationprogram`、`remoteapplicationcmdline` |
 
 ## 默认值
@@ -52,6 +61,7 @@ prompt for credentials:i:0
 redirectclipboard:i:1
 redirectprinters:i:1
 redirectsmartcards:i:1
+redirectwebauthn:i:1
 audiomode:i:0
 audiocapturemode:i:1
 ```
@@ -59,8 +69,11 @@ audiocapturemode:i:1
 窗口化会话默认跟随客户区尺寸调整远端分辨率，并沿用当前显示器 DPI；服务器不支持动态
 分辨率时会自动缩放到窗口内。`.rdp` 中显式设置 `dynamic resolution:i:0` 可关闭此行为。
 
-磁盘不会在无配置时默认开放。USB、摄像头和任意动态设备属性目前会被解析器保留，
-但尚未映射到桌面控件接口。安全对话框仍会按 Windows 当前策略显示已请求的本地资源。
+磁盘、USB、摄像头和动态设备不会在无配置时默认开放。配置后，选择器会逐项应用到系统
+设备、磁盘或摄像头集合：支持 `*`、具体实例/符号链接、设备类 GUID，以及前缀为 `-` 的
+排除项；`DynamicDrives` 和 `DynamicDevices` 会同时启用后续热插拔设备。宿主转发
+`WM_DEVICECHANGE` 并刷新集合。WebAuthn 与 `mstsc` 默认一致为开启，显式设置
+`redirectwebauthn:i:0` 时不会加载系统 WebAuthn DVC 插件。
 
 ## RemoteApp
 

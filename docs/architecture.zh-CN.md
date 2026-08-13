@@ -95,6 +95,17 @@ ActiveX 不是普通子窗口。宿主实现以下 OLE 接口：
 消息循环先把键盘消息交给 `IOleInPlaceActiveObject::TranslateAccelerator`，确保
 远程桌面的组合键和 ActiveX 内部导航正常工作。
 
+传统 `/span` 由宿主容器处理，而不是伪装成 `use multimon`。宿主枚举本地显示器，验证
+它们具有相同分辨率并水平连续排列，然后创建覆盖虚拟桌面的无边框窗口，把合并尺寸作为
+单一 `DesktopWidth`/`DesktopHeight` 传入控件。该模式固定远端分辨率并关闭动态调整；
+`Ctrl+Alt+Break` 和 `OnRequestGoFullScreen`/`OnRequestLeaveFullScreen` 用于切换容器样式。
+
+本地资源选择使用非脚本接口：`IMsRdpClientNonScriptable3` 提供磁盘和设备集合，
+`IMsRdpDeviceV2` 区分 USB 设备，`IMsRdpClientNonScriptable7` 提供摄像头集合。宿主对每个
+集合设置明确的重定向状态，并把顶层窗口收到的 `WM_DEVICECHANGE` 原样转发给 RDP 控件，
+再执行有上限的重新扫描。WebAuthn 只从 Windows 系统目录加载受系统维护的 `webauthn.dll`
+DVC 插件；关闭属性时不加载插件。
+
 关闭顺序：
 
 1. 解除事件；
@@ -117,7 +128,8 @@ ActiveX 不是普通子窗口。宿主实现以下 OLE 接口：
 - `OnRemoteDesktopSizeChange`
 - 自动重连事件
 
-回调对象实现 `IDispatch`，把事件投递回主窗口线程。连接状态用于窗口标题和日志；
+回调对象实现带 `IDispatch` vtable 的 `IMsTscAxEvents` 出站接口，把事件投递回主窗口线程。
+连接状态用于窗口标题和日志；
 断开参数用于诊断。证书、凭据和重定向警告对话框由系统控件显示，宿主不替换或自动
 确认它们。
 
@@ -128,7 +140,12 @@ ActiveX 不是普通子窗口。宿主实现以下 OLE 接口：
 1. `--password`
 2. `--password-env NAME`
 3. 默认环境变量 `MSTSC_RS_PASSWORD`
-4. Win32 补全界面
+4. Win32 补全界面（未提供服务器时）
+
+用户名和密码都不是启动连接的硬性条件。缺少其中任意一项时，宿主不向非脚本凭据接口
+注入明文密码，由 Windows RDP 控件、凭据界面和凭据管理器完成认证。`.rdp` 中的
+`password 51` 会继续被无损保留，但宿主不会尝试解密或把其误当成明文密码；没有显式明文
+密码时仍走系统凭据路径。
 
 明文密码不会加入普通 `.rdp` 文本。连接前通过桌面控件的
 `IMsTscNonScriptable::ClearTextPassword` 写入；这是非脚本 COM 接口，密码不会经过

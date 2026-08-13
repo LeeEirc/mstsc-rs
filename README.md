@@ -13,13 +13,18 @@ COM 组件。
 - 保留未知属性、未知类型、注释、空行、重复项和未修改行；
 - 将合并后的常用 RDP 设置映射到 Windows 桌面 ActiveX 控件，覆盖显示、打印机、
   剪贴板、智能卡、麦克风、音频、Gateway 和 RemoteApp；
-- 兼容 `/v:`、`/f`、`/w:`、`/h:`、`/admin` 和 `/public`；其他已解析但尚未映射的
-  `mstsc.exe` 开关会保留在 dry-run 设置文本中；
+- 兼容 `/v:`、`/f`、`/w:`、`/h:`、`/admin`、`/public`、`/multimon`、`/span`、
+  `/restrictedAdmin` 和 `/remoteGuard`；
 - GNU 风格参数覆盖 `.rdp`，并可用 `--set name:type:value` 设置任意 RDP 属性；
 - 支持 `--password`、`--password-env` 和默认的 `MSTSC_RS_PASSWORD`，并通过非脚本
   COM 凭据接口传给系统控件；
-- 参数缺少服务器、用户名或密码时显示 Win32 原生补全界面；
+- 缺少服务器时显示 Win32 原生补全界面；缺少用户名或明文密码时交给系统 RDP 控件显示
+  Windows 凭据界面，并可使用 Windows 凭据管理器已有条目；
 - 窗口大小变化时自动更新远端分辨率并匹配当前显示器 DPI，旧服务器自动回退为等比缩放；
+- `/multimon` 和 `selectedmonitors` 会通过系统控件的非脚本/扩展接口应用；
+- `/span` 使用一个覆盖水平虚拟桌面的固定远端桌面，并支持 `Ctrl+Alt+Break` 在跨屏与窗口
+  模式间切换；
+- 支持磁盘、动态 PnP/USB 设备、摄像头和 WebAuthn 重定向，并在设备热插拔时刷新选择；
 - 保留系统证书、身份和本地资源重定向安全提示，不提供静默忽略证书的选项；
 - 一个进程、一个窗口、一个 RDP 会话；
 - Windows x64 原生构建，并通过 GitHub Actions 的 Windows runner 测试和打包。
@@ -54,7 +59,7 @@ mstsc-rs.exe host.rdp `
   --redirect-microphone true
 ```
 
-属性覆盖（运行时是否生效取决于桌面 ActiveX 接口是否映射该属性）：
+USB 和动态设备选择：
 
 ```powershell
 mstsc-rs.exe host.rdp `
@@ -88,9 +93,11 @@ cargo build --release
 target/release/mstsc-rs.exe
 ```
 
-项目只支持在 Windows 上本机构建和运行。ActiveX 控件的加载和原位激活会在 GitHub
-Actions 的 Windows runner 上实际执行；证书对话框、设备重定向和真实 RDP 连接仍需在
-Windows 10/11 环境中手工集成测试。
+项目只支持在 Windows 上本机构建和运行。ActiveX 控件的加载、事件连接点和原位激活会在
+GitHub Actions 的 Windows runner 上实际执行；另有默认忽略、必须显式提供测试主机和凭据的
+真实登录/动态分辨率集成测试。COM 设备集合、全类别重定向连接和 WebAuthn 插件开关已有
+Windows 原生测试；实际摄像头、USB 设备及证书对话框仍需在 Windows 10/11 物理设备环境中
+手工验证。
 
 ## 下载与发布
 

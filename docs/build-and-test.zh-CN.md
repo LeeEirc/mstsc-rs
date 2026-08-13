@@ -33,9 +33,32 @@ cargo build --release
 - 缺失字段识别；
 - Windows x64 release 构建和 EXE 冒烟测试；
 - 从 `System32` 加载 `mstscax.dll`，创建桌面 COM 类、执行 OLE 原位激活，并验证核心
-  设置和非脚本凭据接口。
+  设置、事件连接点、扩展设置、非脚本凭据接口以及磁盘、设备和摄像头集合；
+- 对照系统注册类型库验证关键非脚本接口的 vtable 偏移；
+- 验证 `/span` 对水平双屏的计算，并拒绝垂直或不同分辨率布局。
 
-自动测试不建立真实 RDP 网络连接。
+普通自动测试不建立真实 RDP 网络连接。仓库另带一个默认忽略的 opt-in 集成测试；它会等待
+`OnLoginComplete`，再通过显示控制虚拟通道把远端桌面调整为 1000×700，并等待
+`OnRemoteDesktopSizeChange` 确认结果：
+
+```powershell
+$env:MSTSC_RS_TEST_SERVER = "rdp-lab.example.com"
+$env:MSTSC_RS_TEST_USERNAME = "CONTOSO\rdp-test"
+$securePassword = Read-Host -AsSecureString "RDP test password"
+$env:MSTSC_RS_TEST_PASSWORD = [Net.NetworkCredential]::new("", $securePassword).Password
+cargo test --locked --lib live_rdp_session_reaches_login_complete -- --ignored --nocapture
+Remove-Item Env:MSTSC_RS_TEST_PASSWORD
+$securePassword = $null
+```
+
+可选设置 `$env:MSTSC_RS_TEST_DOMAIN` 指定测试帐户域；设置
+`$env:MSTSC_RS_TEST_WEBAUTHN = "0"` 会要求 WebAuthn 插件保持未加载，省略或设为 `1` 则
+要求插件已加载。`$env:MSTSC_RS_TEST_REDIRECTION = "1"` 会在该次连接中开启磁盘、动态设备、
+USB 和摄像头选择，用于隔离实验主机上的全类别映射测试。
+
+设置 `$env:MSTSC_RS_TEST_FULLSCREEN = "true"` 时，测试还要求控件进入全屏并完成登录。该测试
+为避免无人值守任务卡在证书确认框，会仅在测试会话中使用 `authentication level:i:0`，因此只应
+对隔离实验主机运行，不能替代下面的证书安全提示手工测试。
 
 ### Windows 手工/集成测试
 
@@ -46,7 +69,7 @@ cargo build --release
 3. RD Gateway；
 4. RemoteApp 集合；
 5. 双显示器；
-6. 可重定向的打印机、磁盘、智能卡和麦克风。
+6. 可重定向的打印机、磁盘、智能卡、麦克风、摄像头和 USB/PnP 设备。
 
 建议验证：
 
